@@ -1,0 +1,8 @@
+fastapi==0.115.6
+uvicorn==0.34.0
+pydantic==2.10.4
+python-multipart==0.0.20
+pandas==2.2.3
+APScheduler==3.10.4
+garminconnect==0.2.25
+openai>=1.40,<2

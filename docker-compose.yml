@@ -1,0 +1,29 @@
+services:
+  running-assistant:
+    build: .
+    container_name: running-assistant
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./workouts:/app/workouts
+    restart: unless-stopped
+    networks:
+      - tunnel_net
+
+  cloudflare-tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared_tunnel
+    restart: unless-stopped
+    command: ["tunnel", "--no-autoupdate", "run", "--token", "${CLOUDFLARE_TUNNEL_TOKEN}"]
+    networks:
+      - tunnel_net
+    depends_on:
+      - running-assistant
+
+networks:
+  tunnel_net:
+    driver: bridge
+

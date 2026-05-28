@@ -1,0 +1,539 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>PACER · running coach</title>
+<script>
+// Magic-link bootstrap — runs BEFORE any other resource loads or scripts read
+// location.href, so the API key never leaks via referrer headers or extensions
+// that snapshot the URL on navigation.
+(function(){
+  try{
+    var m=(location.hash||"").match(/key=([^&]+)/);
+    if(m){
+      localStorage.setItem("ra_api_key", decodeURIComponent(m[1]));
+      history.replaceState(null, "", location.pathname);
+    }
+  }catch(_){}
+})();
+</script>
+<link rel="icon" type="image/svg+xml" href='data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="%230a0c09"/><path d="M18 2 L8 18 L14 18 L10 30 L24 12 L18 12 Z" fill="%23c8fb50"/></svg>'>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Anton&family=Sora:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#0a0c09; --bg2:#0f1210; --panel:#141813; --line:rgba(200,251,80,.12);
+    --ink:#eef3e7; --muted:#8a9382; --volt:#c8fb50; --volt-dim:rgba(200,251,80,.14);
+    --green:#74e08a; --amber:#f5c451; --red:#ff5f56;
+    --r:16px;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--bg);color:var(--ink);font-family:"Sora",system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+  body{
+    min-height:100vh;
+    background-image:
+      radial-gradient(900px 500px at 80% -10%, rgba(200,251,80,.10), transparent 60%),
+      linear-gradient(transparent 0 0);
+  }
+  body::before{ /* faint track-lane grid */
+    content:"";position:fixed;inset:0;pointer-events:none;z-index:0;opacity:.5;
+    background-image:linear-gradient(rgba(255,255,255,.018) 1px,transparent 1px);
+    background-size:100% 46px;
+  }
+  a{color:var(--volt)}
+  .mono{font-family:"JetBrains Mono",monospace}
+  /* topbar */
+  header{position:sticky;top:0;z-index:5;display:flex;justify-content:space-between;align-items:center;
+    padding:18px 28px;border-bottom:1px solid var(--line);backdrop-filter:blur(8px);background:rgba(10,12,9,.7)}
+  .brand{font-family:"Anton";font-size:26px;letter-spacing:1px}
+  .brand span{font-family:"Sora";font-weight:400;font-size:12px;color:var(--muted);letter-spacing:3px;text-transform:uppercase;margin-left:8px}
+  .conn{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .conn input{background:#0c0e0b;border:1px solid var(--line);color:var(--ink);border-radius:10px;padding:9px 12px;font-family:"JetBrains Mono";font-size:12px;width:230px}
+  .conn input:focus{outline:none;border-color:var(--volt)}
+  .conn select{background:#0c0e0b;border:1px solid var(--line);color:var(--ink);border-radius:10px;padding:8px 10px;font-family:"JetBrains Mono";font-size:12px;max-width:180px}
+  .conn select:focus{outline:none;border-color:var(--volt)}
+  .dot{width:9px;height:9px;border-radius:50%;background:#444;box-shadow:0 0 0 0 rgba(200,251,80,.6)}
+  .dot.on{background:var(--volt);animation:pulse 2.4s infinite}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(200,251,80,.5)}70%{box-shadow:0 0 0 9px rgba(200,251,80,0)}100%{box-shadow:0 0 0 0 rgba(200,251,80,0)}}
+  button{font-family:"Sora";font-weight:600;font-size:13px;cursor:pointer;border:none;border-radius:10px;
+    padding:9px 14px;background:var(--volt);color:#10130b;transition:transform .12s ease,filter .12s ease}
+  button:hover{filter:brightness(1.08);transform:translateY(-1px)}
+  button:disabled{opacity:.5;cursor:wait;transform:none}
+  button.ghost{background:transparent;border:1px solid var(--line);color:var(--ink)}
+  button.ghost:hover{border-color:var(--volt);color:var(--volt)}
+  main{position:relative;z-index:1;max-width:1180px;margin:0 auto;padding:34px 28px 70px}
+  .eyebrow{font-size:11px;letter-spacing:3px;text-transform:uppercase;color:var(--muted);font-weight:600}
+  /* hero */
+  .hero{display:grid;grid-template-columns:1fr 1.25fr;gap:22px;margin-bottom:22px}
+  .goal h1{font-family:"Anton";font-weight:400;font-size:clamp(40px,6vw,76px);line-height:.92;margin:10px 0 14px;text-transform:uppercase}
+  .goal .accent{color:var(--volt)}
+  .goalmeta{color:var(--muted);font-size:14px;line-height:1.7}
+  .goalmeta b{color:var(--ink);font-family:"JetBrains Mono"}
+  .card{background:linear-gradient(180deg,var(--panel),var(--bg2));border:1px solid var(--line);border-radius:var(--r);padding:20px 22px;
+    opacity:0;transform:translateY(14px);animation:rise .5s forwards}
+  @keyframes rise{to{opacity:1;transform:none}}
+  .card h2{font-family:"Anton";font-weight:400;font-size:16px;letter-spacing:1.5px;margin:0 0 14px;color:var(--ink)}
+  .today.big{padding:24px 26px;position:relative;overflow:hidden}
+  .today.big::after{content:"";position:absolute;right:-40px;top:-40px;width:160px;height:160px;border-radius:50%;background:var(--volt-dim);filter:blur(20px)}
+  .today-main{display:flex;align-items:baseline;gap:18px;margin:12px 0 6px;flex-wrap:wrap}
+  .today .kind{font-family:"Anton";font-size:clamp(30px,4.5vw,52px);text-transform:uppercase;line-height:1}
+  .today .stat{font-family:"JetBrains Mono";font-weight:700;font-size:30px;color:var(--volt)}
+  .today .pace{font-family:"JetBrains Mono";font-size:18px;color:var(--muted)}
+  .note{color:#cdd5c5;font-size:14px;line-height:1.55;margin:8px 0 16px;max-width:46ch}
+  .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:16px}
+  .pill{font-size:12px;font-weight:600;padding:5px 11px;border-radius:999px;border:1px solid var(--line)}
+  .pill.green{color:var(--green);border-color:rgba(116,224,138,.4)} .pill.yellow{color:var(--amber);border-color:rgba(245,196,81,.4)} .pill.red{color:var(--red);border-color:rgba(255,95,86,.45)}
+  .tag{font-family:"JetBrains Mono";font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:1px}
+  .actions{display:flex;gap:10px;flex-wrap:wrap}
+  /* grid */
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:22px}
+  .grid .card:nth-child(2){animation-delay:.05s}.grid .card:nth-child(3){animation-delay:.1s}.grid .card:nth-child(4){animation-delay:.15s}.grid .card:nth-child(5){animation-delay:.2s}.grid .card:nth-child(6){animation-delay:.25s}
+  /* week list */
+  .wk{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px dashed rgba(255,255,255,.06)}
+  .wk:last-child{border-bottom:none}
+  .wk .d{font-family:"JetBrains Mono";font-size:12px;color:var(--muted);width:52px}
+  .wk .k{font-weight:600;text-transform:capitalize;flex:1}
+  .wk .k.rest{color:var(--muted);font-weight:400}
+  .wk .v{font-family:"JetBrains Mono";font-size:13px;color:var(--ink)}
+  .badge{font-size:10px;letter-spacing:.5px;text-transform:uppercase;color:#10130b;background:var(--volt);border-radius:6px;padding:2px 6px;margin-left:8px}
+  .badge.proj{background:transparent;color:var(--muted);border:1px solid var(--line)}
+  .badge.done{background:rgba(116,224,138,.18);color:var(--green)}
+  /* readiness */
+  .score{font-family:"Anton";font-size:64px;line-height:1}
+  .reasons{color:var(--muted);font-size:13px;line-height:1.6;margin-top:8px}
+  .kv{display:flex;justify-content:space-between;font-size:13px;color:var(--muted);padding:4px 0}
+  .kv b{color:var(--ink);font-family:"JetBrains Mono"}
+  /* runs / progress */
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:7px 4px;border-bottom:1px solid rgba(255,255,255,.05)}
+  th{color:var(--muted);font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:1px}
+  td.mono,.mono td{font-family:"JetBrains Mono"}
+  .verdict{font-size:15px;line-height:1.5;margin:6px 0 12px}
+  .big-num{font-family:"JetBrains Mono";font-weight:700;font-size:34px;color:var(--volt)}
+  /* form */
+  form{display:flex;flex-direction:column;gap:10px}
+  select,form input{background:#0c0e0b;border:1px solid var(--line);color:var(--ink);border-radius:10px;padding:10px 12px;font-family:"JetBrains Mono";font-size:13px}
+  select:focus,form input:focus{outline:none;border-color:var(--volt)}
+  label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:1px}
+  /* gate */
+  #gate{position:fixed;inset:0;z-index:20;display:flex;align-items:center;justify-content:center;background:rgba(8,9,7,.92);backdrop-filter:blur(6px)}
+  #gate .box{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:34px;width:min(420px,90vw);text-align:center}
+  #gate h2{font-family:"Anton";font-size:30px;margin:0 0 6px}
+  #gate p{color:var(--muted);font-size:13px;margin:0 0 18px}
+  #gate input{width:100%;margin-bottom:12px;background:#0c0e0b;border:1px solid var(--line);color:var(--ink);border-radius:10px;padding:12px;font-family:"JetBrains Mono"}
+  #gate input:focus{outline:none;border-color:var(--volt)}
+  #gate button{width:100%}
+  .err{color:var(--red);font-size:12px;min-height:16px;margin-top:6px}
+  /* toast */
+  #toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(80px);z-index:30;
+    background:#10130b;border:1px solid var(--volt);color:var(--ink);padding:12px 18px;border-radius:12px;font-size:13px;
+    transition:transform .3s ease;max-width:90vw}
+  #toast.show{transform:translateX(-50%) translateY(0)}
+  .muted{color:var(--muted)}
+  /* Last Run · AI Coach Review */
+  .review{position:relative;overflow:hidden}
+  .review::after{content:"";position:absolute;right:-60px;bottom:-60px;width:220px;height:220px;border-radius:50%;background:radial-gradient(circle at center, var(--volt-dim), transparent 70%);pointer-events:none}
+  .review-head{display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:10px;margin-bottom:14px}
+  .review-day{font-family:"Anton";font-size:clamp(22px,3vw,32px);text-transform:uppercase;letter-spacing:1.4px;line-height:1}
+  .review-day small{display:block;font-family:"Sora";font-size:11px;font-weight:500;letter-spacing:3px;color:var(--muted);text-transform:uppercase;margin-bottom:6px}
+  .review-badge{font-size:10px;background:var(--volt);color:#10130b;padding:5px 11px;border-radius:999px;letter-spacing:1.5px;font-weight:700;text-transform:uppercase}
+  .review-tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:10px;margin:6px 0 18px}
+  .tile{background:linear-gradient(180deg,#0e1010,#0a0c0a);border:1px solid var(--line);border-radius:12px;padding:12px 14px;position:relative;z-index:1}
+  .tile .n{font-family:"JetBrains Mono";font-weight:700;font-size:24px;color:var(--volt);line-height:1.1}
+  .tile .u{display:block;margin-top:6px;font-size:10px;color:var(--muted);letter-spacing:2.5px;text-transform:uppercase}
+  .review-body{display:flex;gap:14px;position:relative;z-index:1}
+  .review-bar{width:3px;flex-shrink:0;background:linear-gradient(180deg,var(--volt) 0%,rgba(200,251,80,0.05) 100%);border-radius:2px}
+  .review-text{font-size:15px;line-height:1.75;color:#dde2d4;flex:1}
+  .review-text p{margin:0 0 12px 0}
+  .review-text p:last-child{margin-bottom:0}
+  @media(max-width:820px){.hero{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">PACER<span>running coach</span></div>
+  <div class="conn">
+    <select id="modelSelect" title="Coach model"><option>model…</option></select>
+    <select id="channelSelect" title="Morning summary channel"><option>channel…</option></select>
+    <input id="keyTop" placeholder="X-API-Key" autocomplete="off" spellcheck="false">
+    <button id="connTop" class="ghost">Reconnect</button>
+    <button id="copyLink" class="ghost" title="Copy a one-click login link (open it on any device)">Copy link</button>
+    <span id="statusDot" class="dot" title="connection"></span>
+  </div>
+</header>
+
+<main id="app" hidden>
+  <section class="hero">
+    <div class="goal">
+      <div class="eyebrow">Goal</div>
+      <h1 id="goalTitle">—</h1>
+      <div class="goalmeta" id="goalMeta"></div>
+    </div>
+    <div class="today big card">
+      <div class="eyebrow">Today · <span id="todayDate" class="mono"></span></div>
+      <div class="today-main">
+        <div class="kind" id="todayKind">—</div>
+        <div class="stat" id="todayDist"></div>
+        <div class="pace" id="todayPace"></div>
+      </div>
+      <div class="note" id="todayNote"></div>
+      <div class="row">
+        <span id="todayReadiness" class="pill"></span>
+        <span id="todaySource" class="tag"></span>
+      </div>
+      <div class="actions">
+        <button data-act="refresh">Re-adapt</button>
+        <button data-act="push" class="ghost">Push to watch</button>
+        <button data-act="notify" class="ghost">Send summary</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="grid">
+    <div class="card"><h2>Recovery</h2><div id="recovery2" class="muted">Your morning Garmin metrics — the "why" behind today.</div><div style="margin-top:14px"><button data-act="metrics" class="ghost">Load metrics</button></div></div>
+    <div class="card"><h2>Fitness</h2><div id="fitness" class="muted">VO₂max · training status · race prediction. Loads with Recovery.</div></div>
+    <div class="card"><h2>7-Day Plan</h2><div id="week" class="muted">…</div></div>
+    <div class="card"><h2>On Pace?</h2><div id="progress" class="muted">Run a live Garmin race-prediction check.</div><div style="margin-top:14px"><button data-act="progress" class="ghost">Check pace</button></div></div>
+    <div class="card"><h2>Readiness</h2><div id="readiness" class="muted">…</div></div>
+    <div class="card"><h2>Consistency</h2><div id="consistency" class="muted">…</div></div>
+    <div class="card"><h2>Last Run · Splits</h2><div id="splits" class="muted">Per-km splits of your latest run.</div><div style="margin-top:14px"><button data-act="splits" class="ghost">Load splits</button></div></div>
+    <div class="card"><h2>Shoe Mileage</h2><div id="gear" class="muted">Km per pair (warns near 600–800 km).</div><div style="margin-top:14px"><button data-act="gear" class="ghost">Load gear</button></div></div>
+    <div class="card review" style="grid-column:1/-1"><h2>Last Run · AI Coach Review</h2>
+      <div id="analysis" class="muted">Once you finish and sync a run, the coach's review will appear here (and arrive via your notification channel).</div>
+    </div>
+    <div class="card" style="grid-column:1/-1"><h2>Ask the Coach 💬</h2>
+      <div id="askOut" class="muted" style="min-height:38px">Ask anything about your training.</div>
+      <div style="display:flex;gap:8px;margin-top:12px"><input id="askInput" placeholder="e.g. can I move my long run to Sunday?" style="flex:1;background:#0c0e0b;border:1px solid var(--line);color:var(--ink);border-radius:10px;padding:10px 12px;font-family:Sora;font-size:13px"><button id="askBtn">Ask</button></div>
+    </div>
+    <div class="card"><h2>Recent Runs</h2><div id="runs" class="muted">…</div></div>
+    <div class="card"><h2>Garmin Sync</h2><div id="sync" class="muted">…</div><div style="margin-top:14px"><button data-act="sync" class="ghost">Sync now</button></div></div>
+    <div class="card"><h2>Set / Change Goal</h2>
+      <div id="goalEta" class="muted" style="margin-bottom:14px;font-size:13px;line-height:1.5">…</div>
+      <form id="goalForm">
+        <label>Distance</label>
+        <select id="gDist">
+          <option value="21.0975">Half marathon — 21.1 km</option>
+          <option value="10">10K</option>
+          <option value="5">5K</option>
+          <option value="42.195">Marathon — 42.2 km</option>
+        </select>
+        <label>Target time (H:MM:SS)</label>
+        <input id="gTime" class="mono" value="2:00:00">
+        <button type="submit">Set goal</button>
+      </form>
+    </div>
+  </section>
+</main>
+
+<div id="gate">
+  <div class="box">
+    <h2>PACER</h2>
+    <p>Enter your API key to connect to the coach.</p>
+    <input id="keyGate" placeholder="X-API-Key" autocomplete="off" spellcheck="false">
+    <button id="connGate">Connect</button>
+    <div class="err" id="gateErr"></div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const KEYNAME = "ra_api_key";
+let KEY = localStorage.getItem(KEYNAME) || "";
+
+function gate(show){ $("#gate").style.display = show ? "flex" : "none"; $("#app").hidden = show; $("#statusDot").classList.toggle("on", !show); }
+function toast(msg){ const t=$("#toast"); t.textContent=msg; t.classList.add("show"); clearTimeout(t._t); t._t=setTimeout(()=>t.classList.remove("show"),3200); }
+const pace = s => s ? `${Math.floor(s/60)}:${String(Math.round(s%60)).padStart(2,"0")}/km` : "";
+function hms(sec){ sec=Math.round(sec); const h=Math.floor(sec/3600),m=Math.floor((sec%3600)/60),s=sec%60; return h?`${h}:${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}`:`${m}:${String(s).padStart(2,"0")}`; }
+const dow = d => { try{return new Date(d+"T00:00:00").toLocaleDateString(undefined,{weekday:"short"});}catch{return d;} };
+
+async function api(path,{method="GET",body=null}={}){
+  const opt={method,headers:{"X-API-Key":KEY}};
+  if(body){opt.headers["Content-Type"]="application/json";opt.body=JSON.stringify(body);}
+  const r=await fetch(path,opt);
+  if(r.status===401){ gate(true); throw new Error("unauthorized"); }
+  const txt=await r.text();
+  try{return JSON.parse(txt);}catch{return txt;}
+}
+
+function renderGoal(g){
+  if(!g||g.error){ $("#goalTitle").textContent="No goal set"; $("#goalMeta").innerHTML="Use <b>Set Goal</b> to begin."; return; }
+  const km=g.distance_km;
+  const name = Math.abs(km-21.0975)<2?"Sub-"+(g.target_pace?"":""):"";
+  const label = Math.abs(km-21.0975)<2?"Half Marathon":Math.abs(km-42.195)<3?"Marathon":Math.abs(km-10)<1.5?"10K":Math.abs(km-5)<1?"5K":km+" km";
+  $("#goalTitle").innerHTML = `<span class="accent">${g.target}</span><br>${label}`;
+  $("#goalMeta").innerHTML = `Target pace <b>${g.target_pace}</b> · ${km} km`;
+}
+function renderToday(t){
+  if(!t||t.error){ $("#todayKind").textContent="—"; return; }
+  $("#todayDate").textContent = t.plan_date||t.date||"";
+  const rest = t.kind==="rest" || !t.distance_km;
+  $("#todayKind").textContent = rest?"Rest":(t.kind||"run");
+  $("#todayDist").textContent = rest?"":`${t.distance_km} km`;
+  $("#todayPace").textContent = rest?"":pace(t.target_pace_sec);
+  $("#todayNote").textContent = t.coach_note || t.details || "";
+  const src = t.source || t.engine || "";
+  $("#todaySource").textContent = src? (src==="adapted"||src==="openai+rules"?"AI-adapted":"rule-based"):"";
+  const rd = (t.readiness && t.readiness.status) ? t.readiness : null;
+  const pill=$("#todayReadiness");
+  if(rd){ pill.style.display=""; pill.className="pill "+rd.status; pill.textContent=`Readiness ${rd.status}${rd.score!=null?" · "+rd.score:""}`; }
+  else pill.style.display="none";
+}
+function renderWeek(w){
+  if(!w||!w.workouts){ $("#week").textContent="—"; return; }
+  $("#week").innerHTML = w.workouts.map(x=>{
+    const rest = x.kind==="rest"||!x.distance_km;
+    const fb = x.firmness&&x.firmness.startsWith("today")?'<span class="badge">today</span>':(x.status==="done"||x.status==="completed")?'<span class="badge done">done</span>':'<span class="badge proj">'+ (x.firmness==="adjusted"?"adj":"proj") +'</span>';
+    const v = rest?'<span class="v muted">—</span>':`<span class="v">${x.distance_km}km · ${pace(x.target_pace_sec)}</span>`;
+    return `<div class="wk"><span class="d">${dow(x.date)}</span><span class="k ${rest?'rest':''}">${rest?'Rest':x.kind}${fb}</span>${v}</div>`;
+  }).join("");
+}
+function renderReadiness(r){
+  if(!r||r.error){ $("#readiness").textContent="—"; return; }
+  const c=r.status;
+  $("#readiness").innerHTML =
+    `<div style="display:flex;align-items:baseline;gap:12px"><span class="score" style="color:var(--${c==='green'?'green':c==='yellow'?'amber':'red'})">${r.score}</span><span class="pill ${c}">${c}</span></div>`+
+    `<div class="reasons">${(r.reasons||[]).join(" · ")}</div>`+
+    `<div style="margin-top:12px"><div class="kv">7-day load <b>${r.weekly_distance_km} km</b></div><div class="kv">4-week avg <b>${r.four_week_avg_km} km</b></div><div class="kv">acute:chronic <b>${r.acute_chronic_ratio??"—"}</b></div></div>`;
+}
+function renderRuns(d){
+  const a=(d&&d.activities)||[];
+  if(!a.length){ $("#runs").innerHTML='<span class="muted">No runs synced yet.</span>'; return; }
+  $("#runs").innerHTML = `<table><tr><th>Date</th><th>Dist</th><th>Pace</th><th>HR</th></tr>`+
+    a.slice(0,8).map(r=>`<tr><td class="mono">${r.activity_date}</td><td class="mono">${r.distance_km}km</td><td class="mono">${pace(r.avg_pace_sec_per_km)}</td><td class="mono">${r.avg_hr||"—"}</td></tr>`).join("")+`</table>`;
+}
+function renderSync(s){
+  if(!s){ $("#sync").textContent="—"; return; }
+  const last=(s.recent_syncs&&s.recent_syncs[0])||null;
+  $("#sync").innerHTML =
+    `<div class="kv">auto-sync <b>${s.auto_sync_enabled?"on":"off"}</b></div>`+
+    `<div class="kv">interval <b>${s.sync_interval_minutes}m</b></div>`+
+    (last?`<div class="kv">last <b>${last.status}</b></div><div class="muted" style="font-size:12px;margin-top:6px">${last.message}</div>`:'<div class="muted" style="font-size:12px">no syncs yet</div>');
+}
+function renderProgress(p){
+  const el=$("#progress");
+  if(!p||p.error){ el.innerHTML=`<span class="muted">${(p&&p.error)||"unavailable"}</span>`; return; }
+  if(p.message&&!p.current_prediction){ el.innerHTML=`<span class="muted">${p.message}</span>`; return; }
+  const onpace=p.on_pace;
+  el.innerHTML =
+    `<div class="big-num" style="color:var(--${onpace?'green':'amber'})">${p.current_prediction}</div>`+
+    `<div class="muted" style="font-size:12px;margin:2px 0 10px">predicted · target ${p.goal.target} · gap ${p.gap_to_target}</div>`+
+    `<div class="verdict">${p.verdict}</div>`+
+    `<div class="tag">trend ${p.trend} · ${p.data_points} pts${p.eta_weeks_to_target!=null?" · ETA ~"+p.eta_weeks_to_target+"w":""}</div>`+
+    sparkline(p.series||[], (p.goal&&p.goal.target_seconds)||0);
+}
+
+function prettyStatus(s){ return String(s).replace(/_\d+$/,"").replace(/_/g," ").toLowerCase().replace(/^\w/,c=>c.toUpperCase()); }
+function sparkline(series,targetSec){
+  if(!series||!series.length||!targetSec) return "";
+  const W=280,H=72,pad=8;
+  const vals=series.map(p=>p.predicted_seconds).concat([targetSec]);
+  const mn=Math.min(...vals),mx=Math.max(...vals),rng=(mx-mn)||1;
+  const x=i=> series.length>1? pad+i*(W-2*pad)/(series.length-1) : W/2;
+  const y=v=> H-pad-(v-mn)/rng*(H-2*pad);
+  const ty=y(targetSec).toFixed(1);
+  const last=series[series.length-1], col=last.on_pace?"var(--green)":"var(--amber)";
+  const pts=series.map((p,i)=>`${x(i).toFixed(1)},${y(p.predicted_seconds).toFixed(1)}`).join(" ");
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" preserveAspectRatio="none" style="margin-top:10px;overflow:visible">
+    <line x1="${pad}" y1="${ty}" x2="${W-pad}" y2="${ty}" stroke="var(--muted)" stroke-dasharray="3 3"/>
+    <text x="${W-pad}" y="${ty-4}" fill="var(--muted)" font-size="9" text-anchor="end" font-family="JetBrains Mono">target</text>
+    ${series.length>1?`<polyline points="${pts}" fill="none" stroke="${col}" stroke-width="2"/>`:""}
+    ${series.map((p,i)=>`<circle cx="${x(i).toFixed(1)}" cy="${y(p.predicted_seconds).toFixed(1)}" r="2.6" fill="${col}"/>`).join("")}
+  </svg>`;
+}
+function renderMetrics(s){
+  const r=(s&&s.recovery)||{}, f=(s&&s.fitness)||{};
+  if(!s||s.error){ $("#recovery2").innerHTML=`<span class="muted">${(s&&s.error)||'unavailable'}</span>`; return; }
+  const kv=(l,v,suf="")=> v==null?"":`<div class="kv">${l} <b>${v}${suf}</b></div>`;
+  $("#recovery2").innerHTML =
+    (r.training_readiness!=null?`<div style="display:flex;align-items:baseline;gap:10px;margin-bottom:8px"><span class="big-num" style="font-size:30px">${r.training_readiness}</span><span class="tag">${(r.training_readiness_level||'readiness').toLowerCase()}</span></div>`:"")+
+    kv("HRV", r.hrv_status, r.hrv_last_night_ms?` · ${r.hrv_last_night_ms}ms`:"")+
+    kv("Sleep", r.sleep_score, r.sleep_hours?` · ${r.sleep_hours}h`:"")+
+    kv("Body battery", r.body_battery)+
+    kv("Resting HR", r.resting_hr!=null?Math.round(r.resting_hr):null," bpm")+
+    kv("Stress", r.avg_stress);
+  $("#fitness").innerHTML =
+    (f.vo2max!=null?`<div style="display:flex;align-items:baseline;gap:10px;margin-bottom:8px"><span class="big-num" style="font-size:30px">${f.vo2max}</span><span class="tag">VO₂max</span></div>`:"")+
+    kv("Training status", f.training_status_phrase?prettyStatus(f.training_status_phrase):f.training_status)+
+    (f.half_prediction_sec?`<div class="kv">Half prediction <b>${hms(f.half_prediction_sec)}</b></div>`:"")+
+    kv("Endurance", f.endurance_score);
+}
+function renderStats(s){
+  if(!s||s.error){ $("#consistency").innerHTML='<span class="muted">—</span>'; return; }
+  $("#consistency").innerHTML =
+    `<div style="display:flex;align-items:baseline;gap:10px;margin-bottom:6px"><span class="big-num" style="font-size:34px">${s.completion_pct}%</span><span class="tag">last ${s.window_days}d</span></div>`+
+    `<div class="kv">Completed <b>${s.completed}/${s.planned_run_days}</b></div>`+
+    `<div class="kv">Current streak <b>${s.current_streak}</b></div>`;
+}
+function renderSplits(d){
+  if(!d||d.error){ $("#splits").innerHTML=`<span class="muted">${(d&&d.error)||'unavailable'}</span>`; return; }
+  const laps=d.laps||[];
+  $("#splits").innerHTML = `<div class="tag" style="margin-bottom:8px">${d.date}</div><table><tr><th>Lap</th><th>Dist</th><th>Pace</th><th>HR</th></tr>`+
+    laps.map(l=>`<tr><td class="mono">${l.lap}</td><td class="mono">${l.distance_km}km</td><td class="mono">${pace(l.pace_sec)}</td><td class="mono">${l.avg_hr||'—'}</td></tr>`).join("")+`</table>`;
+}
+function renderGear(d){
+  if(!d||d.error){ $("#gear").innerHTML=`<span class="muted">${(d&&d.error)||'unavailable'}</span>`; return; }
+  const g=d.gear||[];
+  $("#gear").innerHTML = g.length? g.map(x=>`<div class="wk"><span class="k">${x.name}${x.replace_soon?' <span class="badge" style="background:var(--amber);color:#1a1300">replace</span>':''}${x.retired?' <span class="badge proj">retired</span>':''}</span><span class="v">${x.km} km</span></div>`).join("") : '<span class="muted">No gear found.</span>';
+}
+async function loadChannel(){
+  const sel=$("#channelSelect"); if(!sel) return;
+  try{
+    const d=await api("/config/notify");
+    const opts=d.options||["none","email","callmebot"];
+    sel.innerHTML=opts.map(o=>`<option value="${o}"${o===d.channel?' selected':''}>${o}</option>`).join("");
+    sel.dataset.current=d.channel;
+  }catch(e){ sel.innerHTML='<option>error</option>'; }
+}
+async function loadModels(){
+  const sel=$("#modelSelect"); if(!sel) return;
+  try{
+    const d=await api("/openai/models");
+    if(d.error||!(d.models&&d.models.length)){ sel.innerHTML=`<option>${d.error?'(set OPENAI_API_KEY)':'(none)'}</option>`; sel.disabled=true; return; }
+    sel.disabled=false; sel.dataset.current=d.current;
+    sel.innerHTML=d.models.map(m=>`<option value="${m}"${m===d.current?' selected':''}>${m}${m===d.default?' (default)':''}</option>`).join("");
+  }catch(e){ sel.innerHTML='<option>error</option>'; sel.disabled=true; }
+}
+function renderEta(e){
+  const el=$("#goalEta"); if(!el) return;
+  if(!e||!e.explanation){ el.innerHTML='<span class="muted">No active goal yet — set one below.</span>'; return; }
+  let badge='';
+  if(e.on_pace===true) badge=`<span class="pill green" style="margin-right:8px">on pace</span>`;
+  else if(e.estimated_date) badge=`<span class="tag" style="font-family:JetBrains Mono;font-size:12px;margin-right:8px">est. ${_escapeHtml(e.estimated_date)}</span>`;
+  el.innerHTML=`<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:6px">${badge}<b style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:2px">Estimated target completion</b></div><div>${_escapeHtml(e.explanation)}</div>`;
+}
+async function loadEta(){
+  try{ const e=await api("/goal/eta"); renderEta(e); }
+  catch(_){ const el=$("#goalEta"); if(el) el.innerHTML='<span class="muted">No active goal yet — set one below.</span>'; }
+}
+function _escapeHtml(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+async function loadAnalysis(){
+  const el=$("#analysis"); if(!el) return;
+  try{
+    const d=await api("/activities/last/analysis");
+    if(!d||!d.summary){ el.innerHTML=`<span class="muted">${(d&&d.message)||'No analyses yet.'}</span>`; return; }
+    let dayLabel=d.date||'';
+    try{ dayLabel=new Date(d.date+"T00:00:00").toLocaleDateString(undefined,{weekday:'long',day:'numeric',month:'long'}); }catch(_){}
+    const tiles=[];
+    if(d.distance_km!=null) tiles.push(`<div class="tile"><div class="n">${d.distance_km}</div><span class="u">km</span></div>`);
+    if(d.pace) tiles.push(`<div class="tile"><div class="n">${d.pace.replace('/km','')}</div><span class="u">pace · /km</span></div>`);
+    if(d.avg_hr) tiles.push(`<div class="tile"><div class="n">${d.avg_hr}</div><span class="u">bpm</span></div>`);
+    const paragraphs=(d.summary||'').split(/\n{2,}/).filter(Boolean)
+      .map(p=>`<p>${_escapeHtml(p).replace(/\n/g,'<br>')}</p>`).join('') || `<p>${_escapeHtml(d.summary)}</p>`;
+    el.innerHTML=`
+      <div class="review-head">
+        <div class="review-day"><small>Coach review</small>${dayLabel}</div>
+        <span class="review-badge">⚡ AI</span>
+      </div>
+      <div class="review-tiles">${tiles.join('')}</div>
+      <div class="review-body"><div class="review-bar"></div><div class="review-text">${paragraphs}</div></div>`;
+  }catch(e){ el.innerHTML='<span class="muted">error loading</span>'; }
+}
+async function askCoach(){
+  const q=$("#askInput").value.trim(); if(!q) return;
+  const out=$("#askOut"); out.innerHTML='<span class="muted">thinking…</span>';
+  try{ const r=await api("/goal/coach/ask",{method:"POST",body:{question:q}});
+    out.innerHTML = r.answer? `<div class="verdict">${_escapeHtml(r.answer)}</div>` : `<span class="muted">${_escapeHtml(r.error)||'no answer'}</span>`;
+  }catch(e){ out.innerHTML=`<span class="muted">error: ${_escapeHtml(e.message)}</span>`; }
+}
+
+async function loadAll(){
+  gate(false);
+  const jobs = [
+    ["#goalTitle", ()=>api("/goal").then(renderGoal)],
+    ["today", ()=>api("/goal/today").then(renderToday)],
+    ["week", ()=>api("/goal/week").then(renderWeek)],
+    ["readiness", ()=>api("/readiness").then(renderReadiness)],
+    ["runs", ()=>api("/activities/runs?limit=8").then(renderRuns)],
+    ["sync", ()=>api("/sync/status").then(renderSync)],
+    ["consistency", ()=>api("/goal/stats").then(renderStats)],
+    ["models", ()=>loadModels()],
+    ["channel", ()=>loadChannel()],
+    ["analysis", ()=>loadAnalysis()],
+    ["eta", ()=>loadEta()],
+  ];
+  for(const [,fn] of jobs){ fn().catch(()=>{}); }
+}
+
+async function act(name,btn){
+  const orig=btn.textContent; btn.disabled=true; btn.textContent="…";
+  try{
+    if(name==="refresh"){ const w=await api("/goal/today/refresh?live=true",{method:"POST"}); renderToday(w); toast("Today re-adapted ("+(w.engine||"")+")"); }
+    else if(name==="push"){ const r=await api("/goal/today/push",{method:"POST"}); toast(r.status==="ok"?"Pushed to Garmin ✓":(r.status||"done")); }
+    else if(name==="notify"){
+      const r=await api("/goal/today/notify",{method:"POST"});
+      const ch = ($("#channelSelect")&&$("#channelSelect").value) || "";
+      const chLabel = ch==="email"?"Email":ch==="callmebot"?"WhatsApp":ch==="none"?"":ch;
+      toast(r.status==="sent" ? (chLabel?chLabel+" sent ✓":"Sent ✓")
+          : r.status==="disabled" ? "Notifications disabled (pick a channel in the header)"
+          : r.status==="skipped" ? ("Skipped: "+(r.reason||""))
+          : r.status);
+    }
+    else if(name==="sync"){ const r=await api("/sync/garmin?days=30",{method:"POST"}); toast(r.message||"synced"); api("/activities/runs?limit=8").then(renderRuns); api("/sync/status").then(renderSync); }
+    else if(name==="progress"){ const p=await api("/goal/progress?weeks=12"); renderProgress(p); }
+    else if(name==="metrics"){ const s=await api("/garmin/snapshot"); renderMetrics(s); }
+    else if(name==="splits"){ const d=await api("/activities/last/splits"); renderSplits(d); }
+    else if(name==="gear"){ const d=await api("/gear"); renderGear(d); }
+  }catch(e){ toast("Error: "+e.message); }
+  btn.disabled=false; btn.textContent=orig;
+}
+
+function connect(k){
+  KEY=k.trim(); if(!KEY){return;}
+  localStorage.setItem(KEYNAME,KEY);
+  loadAll();
+}
+
+document.addEventListener("click",e=>{
+  const b=e.target.closest("[data-act]"); if(b) act(b.dataset.act,b);
+});
+$("#goalForm").addEventListener("submit",async e=>{
+  e.preventDefault();
+  try{
+    const r=await api("/goal",{method:"POST",body:{distance_km:parseFloat($("#gDist").value),target_time:$("#gTime").value}});
+    if(r.status==="ok"){
+      if(r.eta) renderEta(r.eta);
+      toast("Goal set ✓");
+      loadAll();
+    } else toast(r.error||"failed");
+  }catch(err){ toast("Error: "+err.message); }
+});
+$("#connGate").addEventListener("click",()=>{ const k=$("#keyGate").value; if(!k){$("#gateErr").textContent="Enter a key";return;} connect(k); });
+$("#keyGate").addEventListener("keydown",e=>{ if(e.key==="Enter")$("#connGate").click(); });
+$("#connTop").addEventListener("click",()=>{ const k=$("#keyTop").value||KEY; connect(k); });
+$("#askBtn").addEventListener("click",askCoach);
+$("#askInput").addEventListener("keydown",e=>{ if(e.key==="Enter")askCoach(); });
+$("#modelSelect").addEventListener("change",async e=>{
+  const m=e.target.value, prev=e.target.dataset.current||m;
+  toast("Testing "+m+"…");
+  try{
+    const r=await api("/config/model",{method:"POST",body:{model:m}});
+    if(r.ok){ e.target.dataset.current=m; toast("Coach model → "+m+" ✓"); }
+    else{ e.target.value=prev; toast("✗ "+(r.error||"failed")); }
+  }catch(err){ e.target.value=prev; toast("✗ "+err.message); }
+});
+$("#channelSelect").addEventListener("change",async e=>{
+  const c=e.target.value, prev=e.target.dataset.current||c;
+  try{
+    const r=await api("/config/notify",{method:"POST",body:{channel:c}});
+    if(r.ok){ e.target.dataset.current=c; toast("Notify channel → "+c+" ✓"); }
+    else{ e.target.value=prev; toast("✗ "+(r.error||"failed")); }
+  }catch(err){ e.target.value=prev; toast("✗ "+err.message); }
+});
+$("#copyLink").addEventListener("click",async()=>{
+  if(!KEY){ toast("Connect first"); return; }
+  const link=location.origin+"/#key="+encodeURIComponent(KEY);
+  try{ await navigator.clipboard.writeText(link); toast("One-click login link copied — open it on any device"); }
+  catch{ toast(link); }
+});
+
+// Boot. The magic-link strip already ran in <head> (so the key is gone from
+// location.href before any other script could read it); KEY was read from
+// localStorage at the top of this script.
+if(KEY){ $("#keyTop").value=KEY; loadAll(); } else { gate(true); }
+</script>
+</body>
+</html>

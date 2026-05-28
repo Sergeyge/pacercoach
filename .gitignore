@@ -1,0 +1,38 @@
+# Secrets — NEVER commit
+.env
+.env.local
+.env.*.local
+
+# Runtime state (DB + Garmin OAuth tokens + generated workouts)
+data/
+workouts/
+
+# Backups / scratch
+*.bk
+*_bk
+docker-compose.yml_bk
+oracle.png
+*.tgz
+pacer.tgz
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*~

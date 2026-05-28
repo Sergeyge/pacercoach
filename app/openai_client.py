@@ -1,0 +1,167 @@
+from __future__ import annotations
+
+import json
+import sys
+from typing import Any
+
+from .settings import settings
+
+
+def _log_exc(where: str, exc: BaseException) -> None:
+    print(f"[openai_client.{where}] {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+
+_SYSTEM_PROMPT = (
+    "You are an expert running coach adjusting a single day's workout for an athlete "
+    "training toward a goal. You are given the rule-based plan for today, the athlete's "
+    "recent completed-vs-planned results, and this morning's recovery metrics. "
+    "Produce the final workout for today.\n"
+    "Rules you MUST follow:\n"
+    "- Respect the provided safety bounds: 'distance_km' must be between 0 and "
+    "'max_distance_km', and 'kind' must be one of 'allowed_kinds'.\n"
+    "- If recovery is poor, reduce volume/intensity or prescribe rest. If the athlete is "
+    "fresh and on track, keep the planned work.\n"
+    "- Keep changes conservative; never increase load sharply.\n"
+    "Respond with ONLY a JSON object: {\"kind\": str, \"distance_km\": number, "
+    "\"target_pace_sec\": int|null, \"details\": str, \"coach_note\": str}. "
+    "'coach_note' is one short sentence explaining the adjustment."
+)
+
+_COACH_CHAT_SYSTEM = (
+    "You are the athlete's personal running coach. Answer their question briefly and "
+    "practically (2-4 sentences) using the provided context: their goal, today's planned "
+    "workout, recent results, and readiness. Be encouraging but honest. Do not invent data "
+    "you weren't given; if you can't answer from the context, say so."
+)
+
+
+def current_model() -> str:
+    """Active model — runtime override (DB) falling back to the env default."""
+    from .db import get_config
+
+    return get_config("openai_model", settings.openai_model) or settings.openai_model
+
+
+def _client():
+    if not settings.openai_api_key:
+        return None
+    try:
+        from openai import OpenAI
+    except ImportError:
+        return None
+    return OpenAI(api_key=settings.openai_api_key)
+
+
+def _create(client, model: str, messages: list, json_mode: bool = False, max_out: int = 400, temperature: float = 0.3):
+    """Call chat.completions, tolerating parameter differences across model families.
+
+    GPT-5 / o-series models use 'max_completion_tokens' (not 'max_tokens') and may only
+    accept the default temperature, so we retry with progressively simpler params on
+    parameter-related errors (and re-raise anything else)."""
+    base: dict[str, Any] = {"model": model, "messages": messages}
+    if json_mode:
+        base["response_format"] = {"type": "json_object"}
+    variants = [
+        {"max_tokens": max_out, "temperature": temperature},
+        {"max_completion_tokens": max_out, "temperature": temperature},
+        {"max_completion_tokens": max_out},
+        {},
+    ]
+    err: Exception | None = None
+    for extra in variants:
+        try:
+            return client.chat.completions.create(**base, **extra)
+        except Exception as exc:  # noqa: BLE001
+            err = exc
+            msg = str(exc).lower()
+            if not any(t in msg for t in ("max_tokens", "max_completion", "temperature", "unsupported", "not supported", "parameter", "invalid_request")):
+                raise
+    raise err  # type: ignore[misc]
+
+
+def coach_adjust(context: dict[str, Any]) -> dict[str, Any] | None:
+    """Today's adjusted workout as JSON. None on any failure (caller falls back to rules)."""
+    client = _client()
+    if client is None:
+        return None
+    try:
+        resp = _create(
+            client,
+            current_model(),
+            [{"role": "system", "content": _SYSTEM_PROMPT}, {"role": "user", "content": json.dumps(context, default=str)}],
+            json_mode=True,
+            max_out=2000,  # reasoning models (GPT-5/o-series) spend tokens thinking before output
+            temperature=0.3,
+        )
+        content = resp.choices[0].message.content
+        if not content or not content.strip():
+            return None
+        return json.loads(content)
+    except Exception as exc:
+        # Caller falls back to rule-based adapter — log so a permanent OpenAI
+        # breakage (revoked key, removed model, quota exhausted) doesn't look
+        # like "engine: rules-only is just the normal mode".
+        _log_exc("coach_adjust", exc)
+        return None
+
+
+def coach_answer(context: dict[str, Any], question: str) -> str | None:
+    """Free-form coaching answer. None on any failure."""
+    client = _client()
+    if client is None:
+        return None
+    try:
+        resp = _create(
+            client,
+            current_model(),
+            [{"role": "system", "content": _COACH_CHAT_SYSTEM}, {"role": "user", "content": json.dumps({"context": context, "question": question}, default=str)}],
+            json_mode=False,
+            max_out=1500,  # leave room for reasoning models to think + answer
+            temperature=0.4,
+        )
+        content = resp.choices[0].message.content
+        return content if content and content.strip() else None
+    except Exception as exc:
+        _log_exc("coach_answer", exc)
+        return None
+
+
+def ping(model: str) -> tuple[bool, str | None]:
+    """Validate a model end-to-end (incl. JSON mode, which the daily coach uses)."""
+    client = _client()
+    if client is None:
+        return False, "OPENAI_API_KEY not set or openai package missing"
+    try:
+        resp = _create(
+            client,
+            model,
+            [{"role": "user", "content": 'Reply with JSON: {"ok": true}'}],
+            json_mode=True,
+            max_out=1500,  # realistic budget so reasoning models aren't starved during the test
+            temperature=0,
+        )
+        content = resp.choices[0].message.content
+        if not content or not content.strip():
+            return False, "model returned empty output (likely a reasoning model needing a larger token budget)"
+        return True, None
+    except Exception as exc:
+        return False, str(exc)[:200]
+
+
+# Curated shortlist (cheap → strong); only those actually on the account are shown.
+_COMMON_MODELS = ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-4.1", "gpt-5-mini", "gpt-5", "gpt-5.5"]
+
+
+def list_models() -> dict[str, Any]:
+    """Curated common chat models available on the account, plus current + default."""
+    base = {"current": current_model(), "default": settings.openai_model}
+    client = _client()
+    if client is None:
+        return {**base, "models": [], "error": "OPENAI_API_KEY not set"}
+    try:
+        available = {m.id for m in client.models.list().data}
+        models = [m for m in _COMMON_MODELS if m in available]
+        if base["current"] not in models:
+            models.append(base["current"])  # always show the active selection
+        return {**base, "models": models}
+    except Exception as exc:
+        return {**base, "models": [], "error": str(exc)[:200]}
