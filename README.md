@@ -1,16 +1,15 @@
-# Running Personal Assistant — Automated Garmin Sync MVP
+# PACER — Personal Adaptive Coach
 
-This version adds automatic Garmin sync on top of the previous CSV importer, plus
-live Garmin health/fitness metrics and API-key authentication.
+Self-hosted FastAPI service that turns Garmin Connect data into an adaptive
+running plan, scores readiness, and pushes today's workout to your watch each
+morning. OpenAI does the daily coach-layer adaptation; a deterministic
+rule-based engine is the fallback.
 
-## Important Garmin note
+The dashboard (single-file HTML at `/`) shows today's plan, last run's AI
+coach review, recovery + fitness, goal progress with an LLM-driven ETA, and
+a chat with the coach.
 
-There are two ways to automate Garmin data ingestion:
-
-1. **Production / correct path:** Garmin Connect Developer Program using OAuth 2.0. This requires Garmin approval and is business-focused.
-2. **Personal prototype path:** `python-garminconnect`, a community library that logs into Garmin Connect. This may break if Garmin changes login flows and should not be used as a commercial/production integration.
-
-This MVP implements option 2 so you can run it now. The Garmin session is created in `app/garmin_client.py` and used by `app/garmin_sync.py`, `app/garmin_metrics.py`, and `app/workout_publisher.py` so it can later be replaced by the official OAuth integration.
+Live instance: <https://app.fanrun.app> (single user, magic-link gated).
 
 ## Run locally
 
@@ -19,70 +18,78 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-# edit .env with your Garmin credentials AND a strong API_KEY (see Authentication)
+# fill in: GARMIN_EMAIL, GARMIN_PASSWORD, API_KEY (strong random), optionally OPENAI_API_KEY
 uvicorn app.main:app --reload
 ```
 
-Open the **dashboard** (enter your `API_KEY` when prompted) or the API docs:
+Open the dashboard, paste your `API_KEY` in the gate:
 
 ```text
-http://127.0.0.1:8000/          # PACER dashboard (UI)
+http://127.0.0.1:8000/          # PACER dashboard
 http://127.0.0.1:8000/docs      # Swagger API docs
 ```
 
-## Run with Docker
+## Run with Docker (canonical)
 
 ```bash
 cp .env.example .env
-# edit .env
+# fill in GARMIN_EMAIL/PASSWORD, API_KEY, OPENAI_API_KEY, NOTIFY_CHANNEL,
+# and CLOUDFLARE_TUNNEL_TOKEN (see "Public exposure" below) — see .env.example
 docker compose up -d --build
 ```
 
-The bundled `docker-compose.yml` also defines a `cloudflare-tunnel` service for
-reaching the app beyond localhost — see **Exposing the app publicly** below.
-Whenever the app is reachable beyond localhost, **`API_KEY` must be set** (see
-Authentication).
-
-> Note: code lives in the image (`COPY app ./app`), so after editing `app/` you
-> must rebuild **and** recreate the container:
-> `docker compose up -d --build --force-recreate running-assistant`
-
-## Exposing the app publicly (Cloudflare Tunnel)
-
-There is **no inbound port open to the internet** — the published `8000:8000`
-mapping is reachable only on the host and its LAN. Public access goes through a
-Cloudflare Tunnel, and **every request still needs the `X-API-Key` header** (see
-Authentication). Never expose the app without `API_KEY` set.
-
-### Free / instant — TryCloudflare quick tunnel
-
-Gives a random, temporary `*.trycloudflare.com` URL with no domain and no account.
-Run it on the same Docker network as the app:
+Code lives in the image (`COPY app ./app`); after editing `app/*` rebuild **and**
+force-recreate so the running container picks up the new image:
 
 ```bash
-docker run -d --name running-assistant-quicktunnel \
-  --network "$(docker network ls --format '{{.Name}}' | grep tunnel_net | head -1)" \
-  cloudflare/cloudflared:latest \
-  tunnel --no-autoupdate --url http://running-assistant:8000
-
-# print the public URL
-docker logs running-assistant-quicktunnel 2>&1 | grep -o 'https://[a-z0-9-]*\.trycloudflare\.com'
+docker compose up -d --build --force-recreate running-assistant
 ```
 
-- The URL is **ephemeral** — it changes every time the container restarts.
-- Stop / remove it: `docker rm -f running-assistant-quicktunnel`.
+The bundled `docker-compose.yml` also defines a `cloudflare-tunnel` service for
+public access — see **Public exposure** below.
 
-### Stable — named tunnel + your own domain
+## Production deployment
 
-The `cloudflare-tunnel` service in `docker-compose.yml` runs a *named* tunnel via
-a tunnel token. For a permanent hostname you need a **domain you own** (domain
-names may not contain underscores) added to Cloudflare, then a public-hostname
-route mapping e.g. `app.yourdomain.com → http://running-assistant:8000`.
+The live instance runs on an **Oracle Cloud Always Free Ampere A1** VM (ARM,
+Tel Aviv region, 1 OCPU / 6 GB) behind a Cloudflare Tunnel pointed at the
+domain `app.fanrun.app`. The architecture is fully outbound — no inbound
+ports open to the public internet — so the same `docker compose up -d` works
+on any Linux host that has Docker installed.
+
+The image builds for both `linux/amd64` and `linux/arm64` (all dependencies in
+`requirements.txt` have ARM wheels).
+
+## Public exposure (Cloudflare Tunnel)
+
+The compose file runs a `cloudflared` container alongside the app. Public
+traffic enters Cloudflare's edge → Cloudflare delivers the request down an
+outbound-initiated, persistent QUIC connection to the cloudflared container
+→ cloudflared proxies to `running-assistant:8000` on the internal docker
+network. Your host never accepts inbound HTTP — port 8000 is only reachable
+from inside the docker network.
+
+Set up:
+
+1. In the Cloudflare dashboard create a **Named Tunnel** (Zero Trust → Networks
+   → Tunnels). Copy the long base64-ish token.
+2. Put it in `.env`:
+   ```text
+   CLOUDFLARE_TUNNEL_TOKEN=eyJh...
+   ```
+3. Add a **Public Hostname** route on the same tunnel:
+   `app.yourdomain.com → http://running-assistant:8000`
+4. `docker compose up -d`
+
+The token is interpolated into the cloudflared `command:` line at compose-parse
+time — it lives **only** in `.env` (which is gitignored), never in the
+committed compose file.
+
+Every request still requires the `X-API-Key` header (see Authentication).
 
 ## Authentication
 
-Every endpoint requires an API key sent in the `X-API-Key` header. The only
-unauthenticated paths are `/health`, `/docs`, `/openapi.json`, and `/redoc`.
+Every endpoint requires an API key in the `X-API-Key` header. Open paths:
+`/`, `/dashboard`, `/health`, `/docs`, `/openapi.json`, `/redoc`.
 
 Set a strong key in `.env`:
 
@@ -90,7 +97,7 @@ Set a strong key in `.env`:
 API_KEY=your-strong-random-key
 ```
 
-Generate one with:
+Generate one:
 
 ```bash
 python3 -c "import secrets; print(secrets.token_urlsafe(32))"
@@ -98,274 +105,228 @@ python3 -c "import secrets; print(secrets.token_urlsafe(32))"
 
 Behaviour:
 
-- Missing/incorrect key on a protected endpoint → `401`.
-- Server started without `API_KEY` set → protected endpoints return `503` (fails closed, never wide open).
+- Missing/incorrect key on a protected endpoint → `401` (constant-time compare)
+- Server started without `API_KEY` set → `503` (fails closed, never wide open)
 
-In the examples below, export your key once and reuse it:
+### Magic-link login
 
-```bash
-export API_KEY=your-strong-random-key
+Sharing the API key is awkward, so the dashboard supports a one-click flow:
+
+```text
+https://app.yourdomain.com/#key=<API_KEY>
 ```
 
-In Swagger UI (`/docs`), click **Authorize** and paste the key.
+When you open that link, a `<head>` IIFE runs before anything else:
+
+1. Reads the `#key=…` from `location.hash`
+2. Stores it to `localStorage["ra_api_key"]`
+3. `history.replaceState` rewrites the address bar to clean `/` so the key never
+   sits in browser history, screenshots, or referrer headers
+
+Subsequent dashboard requests attach `X-API-Key` from localStorage. The "Copy
+link" button in the header regenerates this URL for sharing to a new device.
+
+## Configuration (`.env`)
+
+| Var | Purpose |
+|---|---|
+| `GARMIN_EMAIL` / `GARMIN_PASSWORD` | Garmin Connect login |
+| `GARMIN_MFA_CODE` | Optional, if your account requires MFA at login |
+| `API_KEY` | Required for any non-localhost exposure |
+| `OPENAI_API_KEY` | Enables AI coach + ETA + run review (rule-based fallback if unset) |
+| `OPENAI_MODEL` | Default model, runtime-overridable from the dashboard (`/config/model`) |
+| `MORNING_UPDATE_TIME` | Local-time HH:MM of the daily auto-adapt (default `06:00`) |
+| `TIMEZONE` | IANA TZ for the morning cron (default `Asia/Jerusalem`) |
+| `GOAL_AUTO_PUSH` | `true` to also push the adapted workout to Garmin each morning |
+| `NOTIFY_CHANNEL` | `none` / `email` / `callmebot` — runtime-overridable from the dashboard |
+| `SMTP_*`, `EMAIL_*` | Gmail SMTP for the email channel |
+| `CALLMEBOT_PHONE`, `CALLMEBOT_APIKEY` | WhatsApp via CallMeBot for that channel |
+| `AUTO_SYNC_ENABLED`, `SYNC_INTERVAL_MINUTES` | Background Garmin sync loop |
+| `CLOUDFLARE_TUNNEL_TOKEN` | Token from your Cloudflare Named Tunnel |
+
+Persistent state (gitignored):
+- `data/running_assistant.db` — SQLite, all stored runs + goal + plan + analyses
+- `data/garmin_token/` — Cached Garmin OAuth tokens (avoid re-SSO every restart)
+
+## Daily flow
+
+At `MORNING_UPDATE_TIME` (06:00 by default, in your TZ) an in-process
+APScheduler job runs:
+
+1. `run_garmin_sync(days=45, notify_analysis=False)` — pulls latest activities;
+   run-review analyses on new activities are saved to the DB but NOT emailed
+   (to avoid double-emails seconds before the morning summary)
+2. `record_snapshot(goal)` — captures today's Garmin race-prediction
+3. `adapt_today(use_live_metrics=True)` — reads readiness, HRV, sleep, recent
+   planned-vs-actual, calls the OpenAI coach with safe bounds, falls back to
+   rules; writes the adapted workout to `planned_workout`
+4. `send_morning_summary(workout)` — emails the day's workout + coach note
+   (via Gmail SMTP, CallMeBot WhatsApp, or skipped per `NOTIFY_CHANNEL`)
+5. Auto-pushes the adapted workout to Garmin (skipped on rest days). On
+   schedule failure, writes a `sync_log("warn", …)` row and does NOT mark
+   pushed — so next run retries
+
+Any failure at step 3 writes `sync_log("error", …)`, surfacing it in
+`/sync/status` and on the dashboard's Sync card.
+
+## AI features
+
+### Run review on sync
+
+When `run_garmin_sync` ingests new running activities, `analyze_new_runs_and_notify`
+queues them through the OpenAI coach for a per-activity professional summary
+(pace vs target, what went well, concerns, one takeaway). The analysis row is
+**saved BEFORE the email is sent** so the once-per-activity guarantee holds
+even if SMTP retries. The dashboard's *Last Run · AI Coach Review* card shows
+the most recent one.
+
+### Goal ETA
+
+`estimate_eta(goal)` calls the OpenAI coach with: goal, race-prediction
+history, current training plan, last 10 runs, training consistency over 28
+days, load-based readiness, and a live Garmin recovery+fitness snapshot. The
+coach returns `{estimated_date, on_pace, weeks_remaining, explanation}` —
+explicitly instructed to cross-check Garmin predictions against the other
+signals (Garmin tends to be optimistic for longer distances). Cached 6h in
+the `app_config` table; `POST /goal` bypasses the cache.
+
+### Coach chat
+
+`POST /goal/coach/ask` — free-form question, grounded in your goal + plan +
+readiness context. Returns escaped text rendered into the dashboard's "Ask
+the coach" panel.
+
+### Runtime model + channel switching
+
+The dashboard header has dropdowns for:
+- **Model** (`/openai/models` lists curated common models + custom) — changes
+  the active OpenAI model, persisted to the `app_config` table, no restart
+- **Notify channel** (`/config/notify`) — same idea for the notification channel
 
 ## API reference
 
-All endpoints require the `X-API-Key` header **except** `/health`, `/docs`,
-`/openapi.json`, and `/redoc`. Query parameters are listed with their defaults;
-`*` marks a required parameter.
+All endpoints require `X-API-Key` except `/`, `/dashboard`, `/health`,
+`/docs`, `/openapi.json`, `/redoc`. `*` marks a required parameter.
 
 ### System
 
-| Method | Path | Parameters | Description |
-|---|---|---|---|
-| GET | `/health` | — | Liveness check (no auth). |
+| Method | Path | Description |
+|---|---|---|
+| GET | `/health` | Liveness check (no auth). |
 
 ### Data & sync
 
 | Method | Path | Parameters | Description |
 |---|---|---|---|
-| POST | `/sync/garmin` | `days=30` (1–365) | Sync recent runs from Garmin Connect into SQLite. |
-| GET | `/sync/status` | — | Auto-sync config + the most recent sync-log entries. |
-| POST | `/import/garmin-csv` | `distance_unit=km` (`km`\|`miles`), `file`* (multipart) | Import historical runs from a Garmin CSV export. |
-| GET | `/activities/runs` | `limit=50` | List stored running activities (most recent first). |
+| POST | `/sync/garmin` | `days=30`, `notify_analysis=true` | Sync recent runs into SQLite; trigger run-review on new ones. |
+| GET | `/sync/status` | — | Auto-sync config + recent sync-log entries. |
+| POST | `/import/garmin-csv` | `distance_unit=km`, `file`* | Import historical runs from a Garmin CSV export. |
+| GET | `/activities/runs` | `limit=50` | List stored running activities. |
+| GET | `/activities/last/splits` | — | Per-lap splits of your most recent run. |
+| GET | `/activities/last/analysis` | — | Most recent AI coach review. |
+| POST | `/activities/analyze-new` | `limit=5` | Force the analyze hook (skips already-analyzed). |
 
-### Planning (local computation)
+### Planning (legacy rule-based)
 
 | Method | Path | Parameters | Description |
 |---|---|---|---|
 | GET | `/readiness` | — | Readiness score/status from stored load (acute vs. 4-week). |
 | GET | `/plan/today` | `goal=general_fitness`, `today` | Today's recommended session. |
-| GET | `/plan/week` | `target_distance_km` (5–120), `goal=general_fitness`, `start_date` | 7-day plan; target auto-derived if omitted. |
-| GET | `/plan/weekly` | *(alias of `/plan/week`)* | Same as `/plan/week`. |
-| GET | `/assistant/context` | — | Aggregate: readiness + recent runs + today & week plans. |
+| GET | `/plan/week` | `target_distance_km`, `goal`, `start_date` | 7-day plan. |
+| GET | `/assistant/context` | — | Readiness + recent runs + today & week plans bundled. |
 
 ### Goal-driven adaptive plan
 
 | Method | Path | Parameters | Description |
 |---|---|---|---|
-| POST | `/goal` | `{distance_km, target_time}` (JSON body) | Set the goal; builds + stores the plan from current fitness. |
-| GET | `/goal` | `progress=false` | Active goal; `?progress=true` adds Garmin race-prediction vs target (live, slower). |
+| POST | `/goal` | `{distance_km, target_time}` | Set goal; build + store plan from current fitness; return ETA. |
+| GET | `/goal` | `progress=false` | Active goal; `?progress=true` adds Garmin race-prediction. |
 | DELETE | `/goal` | — | Deactivate the active goal. |
-| GET | `/goal/week` | — | 7-day picture: today firm (re-adapted each morning), days 2–7 projected. |
-| GET | `/goal/progress` | `weeks=12` (2–52) | Garmin race-prediction trend for the goal distance vs target (on-pace verdict + ETA). |
-| GET | `/goal/stats` | `days=30` (7–120) | Consistency: % of planned run days completed + current streak. |
-| POST | `/goal/coach/ask` | `{question}` (JSON) | Ask the OpenAI coach a free-form question, grounded in your goal/plan/readiness. |
-| GET | `/goal/plan` | `days=21` (1–120) | Upcoming planned workouts. |
-| GET | `/goal/today` | — | Today's workout (adapted if available, else rule-based; cheap read). |
-| POST | `/goal/today/refresh` | `live=true` | Force the adaptive recompute now (rules + OpenAI + morning metrics). |
+| GET | `/goal/week` | — | 7-day picture: today firm, projected days 2–7. |
+| GET | `/goal/plan` | `days=21` | Upcoming planned workouts. |
+| GET | `/goal/progress` | `weeks=12` | Garmin race-prediction trend vs target. |
+| GET | `/goal/stats` | `days=30` | Consistency (% of run days completed + streak). |
+| GET | `/goal/eta` | `fresh=false` | LLM completion-date estimate + explanation (`?fresh=true` bypasses 6h cache). |
+| POST | `/goal/coach/ask` | `{question}` | Ask the OpenAI coach a free-form question. |
+| GET | `/goal/today` | — | Today's adapted workout (cheap DB read). |
+| POST | `/goal/today/refresh` | `live=true` | Force the adaptive recompute now. |
 | POST | `/goal/today/push` | — | Push today's workout to Garmin (skips rest days). |
-| POST | `/goal/today/notify` | — | Send today's workout + coaching note as a morning summary (per `NOTIFY_CHANNEL`). |
+| POST | `/goal/today/notify` | — | Send today's workout via the configured channel. |
+| POST | `/goal/week/push` | `days=7`, `force=false` | Push next N days to Garmin; `force=true` deletes old then re-pushes. |
 
 ### Live Garmin metrics
 
 | Method | Path | Parameters | Description |
 |---|---|---|---|
-| GET | `/garmin/recovery` | `date` (default today) | Recovery: `training_readiness`, `hrv`, `sleep`, `stress`, `body_battery`, `resting_heart_rate`, `respiration`, `spo2`. |
-| GET | `/garmin/fitness` | `date` (default today) | Performance: `training_status`, `race_predictions`, `vo2max`, `endurance_score`, `hill_score`, `fitness_age`. |
-| GET | `/garmin/snapshot` | `date` (default today) | One login → compact recovery + fitness summary (used by the dashboard). |
-| GET | `/activities/last/splits` | — | Per-lap/km splits of your most recent run. |
+| GET | `/garmin/recovery` | `date` (default today) | Training-readiness, HRV, sleep, stress, body-battery, RHR, respiration, SpO2. |
+| GET | `/garmin/fitness` | `date` (default today) | Training-status, race-predictions, VO2max, endurance, hill, fitness-age. |
+| GET | `/garmin/snapshot` | `date` (default today) | Compact recovery + fitness summary (one login, used by dashboard). |
+| GET | `/garmin/calendar/month` | `year`*, `month0`* (0-11) | Garmin's calendar for a given month. |
+| POST | `/garmin/workout/{workout_id}/schedule` | `date`* | Schedule an existing Garmin workout. |
 | GET | `/gear` | — | Shoe/gear list with total km + replace-soon flag (~600 km). |
 
-### Workouts
+### Workouts (legacy)
 
 | Method | Path | Parameters | Description |
 |---|---|---|---|
-| GET | `/workouts/today/json` | `goal`, `today` | Build today's structured workout and save it as JSON. |
+| GET | `/workouts/today/json` | `goal`, `today` | Build today's structured workout, save JSON. |
 | GET | `/workouts/today/garmin-payload` | `goal`, `today` | Today's workout as a Garmin workout-service payload. |
 | GET | `/workouts/today/download` | `goal`, `today` | Download today's workout JSON file. |
 | POST | `/workouts/today/push-to-garmin` | `goal`, `today`, `schedule=true` | Create (and optionally schedule) today's workout on Garmin. |
-| POST | `/workouts/week/export-json` | `goal`, `start_date` | Export the week's workouts as JSON files. |
-| POST | `/workouts/week/push-to-garmin` | `goal`, `start_date`, `schedule=true` | Create/schedule each run day's workout on Garmin. |
+| POST | `/workouts/week/export-json` | `goal`, `start_date` | Export the week as JSON files. |
+| POST | `/workouts/week/push-to-garmin` | `goal`, `start_date`, `schedule=true` | Create/schedule each day's workout. |
 
-> Workout `goal` defaults to the `TRAINING_GOAL` env value; `today` / `start_date`
-> default to the current date.
+### Config (runtime overrides)
+
+| Method | Path | Body / Params | Description |
+|---|---|---|---|
+| GET | `/openai/models` | — | Curated list of common chat models + current selection. |
+| POST | `/config/model` | `{model}` | Switch the coach model at runtime (validated with a ping first). |
+| GET | `/config/notify` | — | Current notify channel + options. |
+| POST | `/config/notify` | `{channel}` | Switch the notify channel at runtime (`none`/`email`/`callmebot`). |
+
+## Notify channels
+
+| Channel | Setup |
+|---|---|
+| `email` *(recommended)* | Gmail SMTP. Enable 2-Step Verification on your Google account, create a 16-char **App Password** at <https://myaccount.google.com/apppasswords>, then set `SMTP_HOST=smtp.gmail.com`, `SMTP_PORT=587`, `SMTP_USER`, `SMTP_PASS` (the App Password), `EMAIL_FROM`, `EMAIL_TO`. |
+| `callmebot` | WhatsApp via the CallMeBot bot. Message *"I allow callmebot to send me messages"* to `+34 644 51 95 23`; copy the returned API key into `CALLMEBOT_APIKEY`. Set `CALLMEBOT_PHONE` (international format, no `+`). |
+| `none` | Disabled. |
+
+Test the configured channel: `POST /goal/today/notify`.
+
+Switch channels at runtime from the dashboard header dropdown (writes to
+`app_config`, no restart needed) or via `POST /config/notify`.
+
+## Garmin notes
+
+This project uses the community `python-garminconnect` library, which logs
+into Garmin Connect using your email/password and operates on Garmin's
+private web API. It may break if Garmin changes login flows. The Garmin
+session is created in `app/garmin_client.py` and reused by `app/garmin_sync.py`,
+`app/garmin_metrics.py`, and `app/workout_publisher.py` so a future switch to
+the official OAuth2 Developer Program is a localized change.
+
+**Token caching** to avoid SSO rate-limits: after the first successful login,
+OAuth tokens are persisted under `data/garmin_token/` (oauth1 + oauth2 JSON);
+subsequent calls reuse them. Garmin's SSO endpoint will 429 if you log in too
+often (especially after an IP change) — the cache prevents that.
+
+### Workout push to watch
+
+`/workouts/*/push-to-garmin` and `/goal/today/push` create a structured workout
+via `POST /workout-service/workout` and schedule it via
+`POST /workout-service/schedule/{id}`. The `/workout-service/workout/{id}`
+DELETE is used by `daily_coach.adapt_today` (and `/goal/week/push?force=true`)
+to remove a stale push before replacing it — preventing duplicate calendar
+entries on your watch.
+
+If workout creation succeeds but scheduling fails, the result includes
+`schedule_error` — the morning job writes a `sync_log("warn", …)` and does
+NOT call `mark_garmin_pushed`, so the next run will retry.
 
 ### Underlying Garmin data available (not yet exposed)
 
-The `garminconnect` session can read much more than the endpoints above expose.
-These are available to wire into new endpoints:
-
-- **Recovery / readiness:** `get_training_readiness`, `get_hrv_data`, `get_sleep_data`, `get_stress_data`, `get_all_day_stress`, `get_body_battery`, `get_body_battery_events`, `get_rhr_day`, `get_respiration_data`, `get_spo2_data`
-- **Fitness / performance:** `get_training_status`, `get_race_predictions`, `get_max_metrics`, `get_endurance_score`, `get_hill_score`, `get_fitnessage_data`
-- **Activities & records:** `get_activities_by_date`, `get_activities_fordate`, `get_last_activity`, `get_activity`, `get_activity_details`, `get_activity_splits`, `get_activity_weather`, `get_activity_gear`, `get_personal_record`, `upload_activity`, `download_activity`, `create_manual_activity`, `delete_activity`, `set_activity_name`
-- **Workouts:** `get_workouts`, `get_workout_by_id`, `download_workout`
-- **Gear (shoes):** `get_gear`, `get_gear_stats`, `get_gear_ativities`, `get_gear_defaults`, `set_gear_default`
-- **Daily load / stats:** `get_stats`, `get_stats_and_body`, `get_user_summary`, `get_daily_steps`, `get_steps_data`, `get_heart_rates`, `get_intensity_minutes_data`, `get_floors`, `get_progress_summary_between_dates`
-- **Profile / device:** `get_full_name`, `get_user_profile`, `get_userprofile_settings`, `get_unit_system`, `get_goals`, `get_devices`, `get_device_settings`, `get_primary_training_device`
-- **Off-domain (weight/BP/hydration/badges/menstrual, etc.):** `get_weigh_ins`, `add_weigh_in`, `get_body_composition`, `get_blood_pressure`, `get_hydration_data`, `get_earned_badges`, `get_badge_challenges`, `get_menstrual_calendar_data`, `get_pregnancy_summary`
-
-## API flow
-
-Manual sync now:
-
-```bash
-curl -X POST -H "X-API-Key: $API_KEY" "http://127.0.0.1:8000/sync/garmin?days=30"
-```
-
-Check sync status:
-
-```bash
-curl -H "X-API-Key: $API_KEY" http://127.0.0.1:8000/sync/status
-```
-
-Get readiness:
-
-```bash
-curl -H "X-API-Key: $API_KEY" http://127.0.0.1:8000/readiness
-```
-
-Get weekly plan:
-
-```bash
-curl -H "X-API-Key: $API_KEY" "http://127.0.0.1:8000/plan/weekly?target_distance_km=35&goal=half_marathon_sub_2h"
-```
-
-## Automatic sync
-
-Set this in `.env`:
-
-```text
-AUTO_SYNC_ENABLED=true
-SYNC_INTERVAL_MINUTES=60
-```
-
-The app will sync Garmin every 60 minutes and store new running activities in SQLite.
-(The background scheduler runs in-process and is not affected by API-key auth.)
-
-## Existing CSV fallback
-
-The previous `/import/garmin-csv` endpoint still exists, so you can bootstrap the DB with historical data if needed.
-
-```bash
-curl -X POST -H "X-API-Key: $API_KEY" \
-  -F "file=@activities.csv" \
-  "http://127.0.0.1:8000/import/garmin-csv?distance_unit=km"
-```
-
-## Automated planning endpoints
-
-After Garmin sync has imported runs, the planner reads the stored activities and creates recommendations from the latest load/readiness:
-
-```bash
-curl -H "X-API-Key: $API_KEY" http://localhost:8000/readiness
-curl -H "X-API-Key: $API_KEY" http://localhost:8000/plan/today
-curl -H "X-API-Key: $API_KEY" http://localhost:8000/plan/week
-```
-
-Optional parameters:
-
-```bash
-curl -H "X-API-Key: $API_KEY" "http://localhost:8000/plan/today?goal=base"
-curl -H "X-API-Key: $API_KEY" "http://localhost:8000/plan/week?goal=general_fitness&target_distance_km=30"
-```
-
-If `target_distance_km` is omitted, the app calculates it from your recent 4-week average and readiness status.
-
-## Live Garmin metrics
-
-Two endpoints fetch your current Garmin metrics live (each logs in once and reads
-every metric defensively, so a metric your device does not report comes back as
-`null` instead of failing the whole response). Both accept an optional
-`?date=YYYY-MM-DD` (defaults to today) and return `{ "date", "metrics", "errors" }`.
-
-```bash
-curl -H "X-API-Key: $API_KEY" "http://localhost:8000/garmin/recovery" | jq
-curl -H "X-API-Key: $API_KEY" "http://localhost:8000/garmin/fitness?date=2026-05-27" | jq
-```
-
-- `GET /garmin/recovery` → `training_readiness`, `hrv`, `sleep`, `stress`, `body_battery`, `resting_heart_rate`, `respiration`, `spo2`
-- `GET /garmin/fitness` → `training_status`, `race_predictions`, `vo2max`, `endurance_score`, `hill_score`, `fitness_age`
-
-Note: standalone `vo2max` (`get_max_metrics`) can be empty on days without a
-daily sample; the current value is also available under
-`training_status.mostRecentVO2Max`.
-
-## Goal-driven adaptive plan
-
-Define a running goal once; the app builds a periodized plan from your current
-Garmin fitness and, **each morning, adapts that day's workout** to your recent
-results and recovery — a rule-based engine with an **OpenAI** coaching layer on
-top — then (optionally) pushes it to your watch.
-
-Configure in `.env`:
-
-```text
-OPENAI_API_KEY=sk-...          # enables the AI coaching layer (falls back to rules if unset)
-OPENAI_MODEL=gpt-4o-mini       # any OpenAI chat model
-MORNING_UPDATE_TIME=06:00      # local time of the daily auto-update
-TIMEZONE=Asia/Jerusalem
-GOAL_AUTO_PUSH=true            # push the adapted workout to Garmin each morning
-NOTIFY_CHANNEL=callmebot       # morning summary channel: none | callmebot
-CALLMEBOT_PHONE=9725XXXXXXXX   # your WhatsApp number (international, no '+')
-CALLMEBOT_APIKEY=123456        # from CallMeBot activation
-```
-
-**Morning summary delivery (`NOTIFY_CHANNEL`):** each morning the day's workout +
-coaching note can be sent to you. Choose one of:
-
-- **`email` (Gmail SMTP)** — recommended. Enable 2-Step Verification on your Google
-  account, then create a 16-char **App Password** at
-  <https://myaccount.google.com/apppasswords>. Set in `.env`:
-  ```text
-  NOTIFY_CHANNEL=email
-  SMTP_HOST=smtp.gmail.com
-  SMTP_PORT=587
-  SMTP_USER=you@gmail.com
-  SMTP_PASS=xxxxxxxxxxxxxxxx     # the App Password, NOT your Google login
-  EMAIL_FROM=you@gmail.com
-  EMAIL_TO=you@gmail.com
-  ```
-- **`callmebot` (WhatsApp)** — on your phone, WhatsApp `+34 644 51 95 23`
-  *"I allow callmebot to send me messages"* to get an API key, then set
-  `CALLMEBOT_PHONE` / `CALLMEBOT_APIKEY`.
-- **`none`** — disabled.
-
-Test the configured channel with `POST /goal/today/notify`.
-
-Set a goal (open-ended — train until your Garmin race-prediction meets the target):
-
-```bash
-curl -X POST -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
-  -d '{"distance_km": 21.1, "target_time": "2:00:00"}' \
-  http://localhost:8000/goal
-```
-
-Then:
-
-```bash
-curl -H "X-API-Key: $API_KEY" "http://localhost:8000/goal?progress=true"        # goal + Garmin prediction vs target
-curl -H "X-API-Key: $API_KEY" "http://localhost:8000/goal/progress?weeks=12"    # weekly progress report (are you on pace?)
-curl -H "X-API-Key: $API_KEY" http://localhost:8000/goal/week                   # 7-day picture (today firm, rest projected)
-curl -H "X-API-Key: $API_KEY" "http://localhost:8000/goal/plan?days=21"         # upcoming planned workouts
-curl -H "X-API-Key: $API_KEY" http://localhost:8000/goal/today                  # today's workout (cheap read)
-curl -X POST -H "X-API-Key: $API_KEY" http://localhost:8000/goal/today/refresh  # force adaptive recompute now
-curl -X POST -H "X-API-Key: $API_KEY" http://localhost:8000/goal/today/push     # push today's workout to Garmin
-curl -X DELETE -H "X-API-Key: $API_KEY" http://localhost:8000/goal              # clear the active goal
-```
-
-How it works:
-- **Weekly skeleton** (rule-based): Mon easy · Tue strength/rest · Wed quality · Thu rest · Fri long · Sat recovery · Sun rest, with progressive overload and a down week every 4th.
-- **Daily adaptation** at `MORNING_UPDATE_TIME`: today's session is adjusted from readiness/HRV/sleep + recent planned-vs-actual, re-balancing the current week. The OpenAI layer refines it **within safe bounds**; if `OPENAI_API_KEY` is unset or the call fails, it falls back to the deterministic rules (so the morning update never fails).
-- **Storage:** SQLite tables `goal`, `training_plan`, `planned_workout` in `data/running_assistant.db`.
-
-## Garmin workout export / push to watch
-
-The Docker version now includes endpoints that convert the planned run into a structured Garmin workout model and can try to push it to Garmin Connect using the same Garmin credentials from `.env`.
-
-Useful endpoints:
-
-```bash
-curl -H "X-API-Key: $API_KEY" http://localhost:8000/workouts/today/json | jq
-curl -H "X-API-Key: $API_KEY" http://localhost:8000/workouts/today/garmin-payload | jq
-curl -X POST -H "X-API-Key: $API_KEY" http://localhost:8000/workouts/today/push-to-garmin | jq
-curl -X POST -H "X-API-Key: $API_KEY" http://localhost:8000/workouts/week/export-json | jq
-curl -X POST -H "X-API-Key: $API_KEY" http://localhost:8000/workouts/week/push-to-garmin | jq
-```
-
-Exported workout JSON files are stored in `./workouts` on the host.
-
-Notes:
-- The official Garmin Training API is the reliable production-grade way to publish workouts and training plans to Garmin Connect calendars and sync them to compatible devices.
-- This local project uses Garmin Connect's private web API via the community `garminconnect` session (`/workout-service/workout` to create, `/workout-service/schedule/{id}` to schedule). It is useful for personal automation, but Garmin can change the private API and break this flow.
-- If workout creation succeeds but scheduling fails, open Garmin Connect, find the created workout, add it to your calendar, and sync your watch.
+The `garminconnect` session can read much more than the endpoints above
+expose. See [the project's `app/garmin_client.py`](app/garmin_client.py)
+for the underlying methods.
