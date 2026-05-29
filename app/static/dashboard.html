@@ -117,6 +117,22 @@
   .msg .ts{display:block;font-size:10px;color:var(--muted);margin-top:4px;font-family:JetBrains Mono;letter-spacing:1px;text-transform:uppercase}
   .pause-banner{display:flex;align-items:center;gap:10px;padding:10px 14px;background:rgba(255,180,40,.10);border:1px solid rgba(255,180,40,.35);border-radius:10px;font-size:13px;margin-bottom:12px}
   .pause-banner .dot{width:8px;height:8px;border-radius:50%;background:#ffb428;flex:0 0 auto}
+  /* modal */
+  .modal-backdrop{position:fixed;inset:0;background:rgba(8,10,7,.78);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);display:none;align-items:center;justify-content:center;z-index:9999;opacity:0;transition:opacity .18s ease}
+  .modal-backdrop.show{display:flex;opacity:1}
+  .modal{width:min(440px,calc(100% - 32px));background:linear-gradient(180deg,#141813 0%,#10130c 100%);border:1px solid var(--line);border-radius:18px;padding:24px;box-shadow:0 32px 64px -20px rgba(0,0,0,.6),0 0 0 1px rgba(200,251,80,.08);transform:translateY(8px) scale(.985);transition:transform .18s ease}
+  .modal-backdrop.show .modal{transform:translateY(0) scale(1)}
+  .modal-eyebrow{display:flex;align-items:center;gap:8px;font-size:11px;letter-spacing:3px;text-transform:uppercase;color:#ffb428;font-weight:600;margin-bottom:8px}
+  .modal-eyebrow .dot{width:8px;height:8px;border-radius:50%;background:#ffb428}
+  .modal h2{font-family:Anton,system-ui;font-weight:400;font-size:34px;letter-spacing:.5px;margin:0 0 6px 0;color:var(--ink);line-height:1.05}
+  .modal p.muted{font-size:13px;line-height:1.5;color:var(--muted);margin:0 0 18px}
+  .modal label{display:block;font-size:11px;letter-spacing:2px;text-transform:uppercase;color:var(--muted);font-weight:600;margin:14px 0 6px}
+  .modal input{width:100%;background:#0c0e0b;border:1px solid var(--line);color:var(--ink);border-radius:10px;padding:11px 13px;font-family:Sora;font-size:14px;transition:border-color .12s ease}
+  .modal input:focus{outline:none;border-color:var(--volt)}
+  .modal input[type="date"]{color-scheme:dark}
+  .modal-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:22px}
+  .modal-actions button{padding:10px 18px}
+  .modal-hint{font-size:11px;color:var(--muted);margin-top:6px;font-style:italic}
   .big-num{font-family:"JetBrains Mono";font-weight:700;font-size:34px;color:var(--volt)}
   /* form */
   form{display:flex;flex-direction:column;gap:10px}
@@ -250,6 +266,23 @@
 </div>
 
 <div id="toast"></div>
+
+<div id="pauseModal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="pauseModalTitle">
+  <div class="modal">
+    <div class="modal-eyebrow"><span class="dot"></span>Pause plan</div>
+    <h2 id="pauseModalTitle">Take a break</h2>
+    <p class="muted">Morning adapt + auto-push are skipped while paused. The progress trend keeps its baseline so you can see where you left off when you resume.</p>
+    <label for="pauseReason">Reason <span style="text-transform:none;letter-spacing:0;color:var(--muted);font-weight:400">(optional)</span></label>
+    <input id="pauseReason" type="text" placeholder="e.g. knee soreness, work trip, vacation…" maxlength="200" />
+    <label for="pauseUntil">Resume on <span style="text-transform:none;letter-spacing:0;color:var(--muted);font-weight:400">(optional, blank = indefinite)</span></label>
+    <input id="pauseUntil" type="date" />
+    <div class="modal-hint">If you set a date, the plan auto-resumes on that morning.</div>
+    <div class="modal-actions">
+      <button id="pauseCancel" class="ghost">Cancel</button>
+      <button id="pauseConfirm">Pause plan</button>
+    </div>
+  </div>
+</div>
 
 <script>
 const $ = s => document.querySelector(s);
@@ -503,16 +536,28 @@ async function clearChat(){
     toast('Chat cleared');
   }catch(e){ toast('Error: '+e.message); }
 }
-async function pausePlan(){
-  const reason=prompt('Reason for pause (optional, e.g. "knee pain", "vacation"):', '');
-  if(reason===null) return;  // cancelled
-  const until=prompt('Resume on date (YYYY-MM-DD), or leave empty for indefinite:', '');
-  if(until===null) return;  // cancelled
+function _openPauseModal(){
+  const m=$("#pauseModal");
+  $("#pauseReason").value='';
+  $("#pauseUntil").value='';
+  m.classList.add('show');
+  setTimeout(()=>$("#pauseReason").focus(), 60);
+}
+function _closePauseModal(){ $("#pauseModal").classList.remove('show'); }
+async function pausePlan(){ _openPauseModal(); }  // exposed name for the data-act handler
+async function _submitPause(){
+  const reason=$("#pauseReason").value.trim();
+  const until=$("#pauseUntil").value.trim();
+  const btn=$("#pauseConfirm"); const orig=btn.textContent; btn.disabled=true; btn.textContent='…';
   try{
     const r=await api("/goal/pause",{method:"POST",body:{reason:reason||null, until:until||null}});
-    if(r.status==='paused'){ toast('Plan paused ✓'); api("/goal").then(renderGoal); }
-    else toast(r.error||'pause failed');
+    if(r.status==='paused'){
+      toast('Plan paused ✓');
+      _closePauseModal();
+      api("/goal").then(renderGoal);
+    } else toast(r.error||'pause failed');
   }catch(e){ toast('Error: '+e.message); }
+  btn.disabled=false; btn.textContent=orig;
 }
 async function resumePlan(){
   try{
@@ -591,6 +636,15 @@ $("#keyGate").addEventListener("keydown",e=>{ if(e.key==="Enter")$("#connGate").
 $("#connTop").addEventListener("click",()=>{ const k=$("#keyTop").value||KEY; connect(k); });
 $("#askBtn").addEventListener("click",askCoach);
 $("#chatClear").addEventListener("click",clearChat);
+// Pause modal wiring
+$("#pauseCancel").addEventListener("click",_closePauseModal);
+$("#pauseConfirm").addEventListener("click",_submitPause);
+$("#pauseModal").addEventListener("click",e=>{ if(e.target===e.currentTarget) _closePauseModal(); });
+document.addEventListener("keydown",e=>{
+  if(!$("#pauseModal").classList.contains('show')) return;
+  if(e.key==='Escape') _closePauseModal();
+  else if(e.key==='Enter' && (e.target.id==='pauseReason' || e.target.id==='pauseUntil')){ e.preventDefault(); _submitPause(); }
+});
 $("#askInput").addEventListener("keydown",e=>{ if(e.key==="Enter")askCoach(); });
 $("#modelSelect").addEventListener("change",async e=>{
   const m=e.target.value, prev=e.target.dataset.current||m;
