@@ -111,6 +111,12 @@
   th{color:var(--muted);font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:1px}
   td.mono,.mono td{font-family:"JetBrains Mono"}
   .verdict{font-size:15px;line-height:1.5;margin:6px 0 12px}
+  .msg{padding:10px 14px;border-radius:14px;font-size:14px;line-height:1.5;max-width:88%;word-wrap:break-word;white-space:pre-wrap}
+  .msg.user{align-self:flex-end;background:rgba(200,251,80,.10);border:1px solid var(--volt-dim);color:var(--ink)}
+  .msg.assistant{align-self:flex-start;background:#0c0e0b;border:1px solid var(--line);color:var(--ink)}
+  .msg .ts{display:block;font-size:10px;color:var(--muted);margin-top:4px;font-family:JetBrains Mono;letter-spacing:1px;text-transform:uppercase}
+  .pause-banner{display:flex;align-items:center;gap:10px;padding:10px 14px;background:rgba(255,180,40,.10);border:1px solid rgba(255,180,40,.35);border-radius:10px;font-size:13px;margin-bottom:12px}
+  .pause-banner .dot{width:8px;height:8px;border-radius:50%;background:#ffb428;flex:0 0 auto}
   .big-num{font-family:"JetBrains Mono";font-weight:700;font-size:34px;color:var(--volt)}
   /* form */
   form{display:flex;flex-direction:column;gap:10px}
@@ -170,6 +176,8 @@
       <div class="eyebrow">Goal</div>
       <h1 id="goalTitle">—</h1>
       <div class="goalmeta" id="goalMeta"></div>
+      <div id="pauseBanner" class="pause-banner" style="display:none;margin-top:10px"></div>
+      <div id="goalActions" style="margin-top:10px"></div>
     </div>
     <div class="today big card">
       <div class="eyebrow">Today · <span id="todayDate" class="mono"></span></div>
@@ -203,9 +211,13 @@
     <div class="card review" style="grid-column:1/-1"><h2>Last Run · AI Coach Review</h2>
       <div id="analysis" class="muted">Once you finish and sync a run, the coach's review will appear here (and arrive via your notification channel).</div>
     </div>
-    <div class="card" style="grid-column:1/-1"><h2>Ask the Coach 💬</h2>
-      <div id="askOut" class="muted" style="min-height:38px">Ask anything about your training.</div>
-      <div style="display:flex;gap:8px;margin-top:12px"><input id="askInput" placeholder="e.g. can I move my long run to Sunday?" style="flex:1;background:#0c0e0b;border:1px solid var(--line);color:var(--ink);border-radius:10px;padding:10px 12px;font-family:Sora;font-size:13px"><button id="askBtn">Ask</button></div>
+    <div class="card" style="grid-column:1/-1">
+      <div style="display:flex;align-items:baseline;justify-content:space-between;gap:12px">
+        <h2>Ask the Coach 💬</h2>
+        <button id="chatClear" class="ghost" style="font-size:12px;padding:6px 10px">Clear chat</button>
+      </div>
+      <div id="chatThread" style="max-height:340px;overflow-y:auto;display:flex;flex-direction:column;gap:8px;margin-bottom:12px"></div>
+      <div style="display:flex;gap:8px"><input id="askInput" placeholder="e.g. can I move my long run to Sunday?" style="flex:1;background:#0c0e0b;border:1px solid var(--line);color:var(--ink);border-radius:10px;padding:10px 12px;font-family:Sora;font-size:13px"><button id="askBtn">Ask</button></div>
     </div>
     <div class="card"><h2>Recent Runs</h2><div id="runs" class="muted">…</div></div>
     <div class="card"><h2>Garmin Sync</h2><div id="sync" class="muted">…</div><div style="margin-top:14px"><button data-act="sync" class="ghost">Sync now</button></div></div>
@@ -260,12 +272,26 @@ async function api(path,{method="GET",body=null}={}){
 }
 
 function renderGoal(g){
-  if(!g||g.error){ $("#goalTitle").textContent="No goal set"; $("#goalMeta").innerHTML="Use <b>Set Goal</b> to begin."; return; }
+  if(!g||g.error){ $("#goalTitle").textContent="No goal set"; $("#goalMeta").innerHTML="Use <b>Set Goal</b> to begin."; const banner=$("#pauseBanner"); if(banner) banner.style.display='none'; return; }
   const km=g.distance_km;
-  const name = Math.abs(km-21.0975)<2?"Sub-"+(g.target_pace?"":""):"";
   const label = Math.abs(km-21.0975)<2?"Half Marathon":Math.abs(km-42.195)<3?"Marathon":Math.abs(km-10)<1.5?"10K":Math.abs(km-5)<1?"5K":km+" km";
-  $("#goalTitle").innerHTML = `<span class="accent">${g.target}</span><br>${label}`;
-  $("#goalMeta").innerHTML = `Target pace <b>${g.target_pace}</b> · ${km} km`;
+  $("#goalTitle").innerHTML = `<span class="accent">${_escapeHtml(g.target||'')}</span><br>${_escapeHtml(label)}`;
+  $("#goalMeta").innerHTML = `Target pace <b>${_escapeHtml(g.target_pace||'')}</b> · ${_escapeHtml(String(km))} km`;
+  // Pause banner + action buttons
+  const banner=$("#pauseBanner");
+  const actions=$("#goalActions");
+  if(g.paused){
+    if(banner){
+      const reason=g.pause_reason?`<b>${_escapeHtml(g.pause_reason)}</b>`:'no reason given';
+      const until=g.pause_until?` · resumes ${_escapeHtml(g.pause_until)}`:' · indefinite';
+      banner.innerHTML=`<span class="dot"></span><span>Plan paused — ${reason}${until}. Morning adapt + auto-push are skipped.</span>`;
+      banner.style.display='flex';
+    }
+    if(actions) actions.innerHTML='<button data-act="resume" class="ghost">Resume plan</button>';
+  } else {
+    if(banner) banner.style.display='none';
+    if(actions) actions.innerHTML='<button data-act="pause" class="ghost">Pause plan</button>';
+  }
 }
 function renderToday(t){
   if(!t||t.error){ $("#todayKind").textContent="—"; return; }
@@ -432,12 +458,68 @@ async function loadAnalysis(){
       <div class="review-body"><div class="review-bar"></div><div class="review-text">${paragraphs}</div></div>`;
   }catch(e){ el.innerHTML='<span class="muted">error loading</span>'; }
 }
+function _fmtTs(iso){ try{ const d=new Date(iso); return d.toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}); }catch(_){ return iso||''; } }
+function _appendMsg(role, content, ts){
+  const t=$("#chatThread"); if(!t) return;
+  const div=document.createElement('div');
+  div.className='msg '+(role==='user'?'user':'assistant');
+  const safe=_escapeHtml(content||'');
+  div.innerHTML=safe + (ts?`<span class="ts">${_escapeHtml(_fmtTs(ts))}</span>`:'');
+  t.appendChild(div);
+  t.scrollTop=t.scrollHeight;
+}
+async function loadChatHistory(){
+  const t=$("#chatThread"); if(!t) return;
+  try{
+    const d=await api("/goal/coach/history");
+    t.innerHTML='';
+    const msgs=(d&&d.messages)||[];
+    if(!msgs.length){ t.innerHTML='<div class="muted" style="padding:4px">Ask anything about your training. The coach remembers prior exchanges.</div>'; return; }
+    for(const m of msgs) _appendMsg(m.role, m.content, m.created_at);
+  }catch(e){ t.innerHTML='<span class="muted">history unavailable</span>'; }
+}
 async function askCoach(){
-  const q=$("#askInput").value.trim(); if(!q) return;
-  const out=$("#askOut"); out.innerHTML='<span class="muted">thinking…</span>';
-  try{ const r=await api("/goal/coach/ask",{method:"POST",body:{question:q}});
-    out.innerHTML = r.answer? `<div class="verdict">${_escapeHtml(r.answer)}</div>` : `<span class="muted">${_escapeHtml(r.error)||'no answer'}</span>`;
-  }catch(e){ out.innerHTML=`<span class="muted">error: ${_escapeHtml(e.message)}</span>`; }
+  const input=$("#askInput");
+  const q=input.value.trim(); if(!q) return;
+  // optimistic append of user message; remove placeholder if first turn
+  const t=$("#chatThread");
+  const placeholder=t.querySelector('.muted'); if(placeholder) placeholder.remove();
+  _appendMsg('user', q, new Date().toISOString());
+  input.value='';
+  const thinking=document.createElement('div'); thinking.className='msg assistant'; thinking.textContent='thinking…'; thinking.dataset.role='thinking';
+  t.appendChild(thinking); t.scrollTop=t.scrollHeight;
+  try{
+    const r=await api("/goal/coach/ask",{method:"POST",body:{question:q}});
+    thinking.remove();
+    if(r.answer) _appendMsg('assistant', r.answer, new Date().toISOString());
+    else _appendMsg('assistant', r.error||'no answer', new Date().toISOString());
+  }catch(e){ thinking.remove(); _appendMsg('assistant', 'error: '+e.message, new Date().toISOString()); }
+}
+async function clearChat(){
+  if(!confirm('Clear the entire coach chat history? This cannot be undone.')) return;
+  try{
+    await api("/goal/coach/history",{method:"DELETE"});
+    loadChatHistory();
+    toast('Chat cleared');
+  }catch(e){ toast('Error: '+e.message); }
+}
+async function pausePlan(){
+  const reason=prompt('Reason for pause (optional, e.g. "knee pain", "vacation"):', '');
+  if(reason===null) return;  // cancelled
+  const until=prompt('Resume on date (YYYY-MM-DD), or leave empty for indefinite:', '');
+  if(until===null) return;  // cancelled
+  try{
+    const r=await api("/goal/pause",{method:"POST",body:{reason:reason||null, until:until||null}});
+    if(r.status==='paused'){ toast('Plan paused ✓'); api("/goal").then(renderGoal); }
+    else toast(r.error||'pause failed');
+  }catch(e){ toast('Error: '+e.message); }
+}
+async function resumePlan(){
+  try{
+    const r=await api("/goal/resume",{method:"POST"});
+    toast(r.status==='resumed'?'Plan resumed ✓':r.status==='not_paused'?'Not paused':r.status);
+    api("/goal").then(renderGoal);
+  }catch(e){ toast('Error: '+e.message); }
 }
 
 async function loadAll(){
@@ -454,6 +536,7 @@ async function loadAll(){
     ["channel", ()=>loadChannel()],
     ["analysis", ()=>loadAnalysis()],
     ["eta", ()=>loadEta()],
+    ["chat", ()=>loadChatHistory()],
   ];
   for(const [,fn] of jobs){ fn().catch(()=>{}); }
 }
@@ -477,6 +560,8 @@ async function act(name,btn){
     else if(name==="metrics"){ const s=await api("/garmin/snapshot"); renderMetrics(s); }
     else if(name==="splits"){ const d=await api("/activities/last/splits"); renderSplits(d); }
     else if(name==="gear"){ const d=await api("/gear"); renderGear(d); }
+    else if(name==="pause"){ await pausePlan(); }
+    else if(name==="resume"){ await resumePlan(); }
   }catch(e){ toast("Error: "+e.message); }
   btn.disabled=false; btn.textContent=orig;
 }
@@ -505,6 +590,7 @@ $("#connGate").addEventListener("click",()=>{ const k=$("#keyGate").value; if(!k
 $("#keyGate").addEventListener("keydown",e=>{ if(e.key==="Enter")$("#connGate").click(); });
 $("#connTop").addEventListener("click",()=>{ const k=$("#keyTop").value||KEY; connect(k); });
 $("#askBtn").addEventListener("click",askCoach);
+$("#chatClear").addEventListener("click",clearChat);
 $("#askInput").addEventListener("keydown",e=>{ if(e.key==="Enter")askCoach(); });
 $("#modelSelect").addEventListener("change",async e=>{
   const m=e.target.value, prev=e.target.dataset.current||m;

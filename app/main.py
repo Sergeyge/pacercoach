@@ -10,18 +10,24 @@ from pydantic import BaseModel
 from .auth import require_api_key
 from .daily_coach import adapt_today, ensure_horizon
 from .db import (
+    add_coach_message,
+    clear_coach_messages,
     deactivate_goals,
     get_active_goal,
+    get_latest_analysis,
     get_planned_workout,
     init_db,
     link_actuals,
-    get_latest_analysis,
     list_planned_workouts,
+    list_recent_coach_messages,
     list_runs,
     list_sync_log,
     mark_garmin_pushed,
+    pause_active_goal,
+    resume_active_goal,
     set_active_goal,
     set_config,
+    trim_coach_messages,
     upsert_activities,
 )
 from .garmin_client import GarminClientError
@@ -212,6 +218,10 @@ def get_goal(progress: bool = False) -> dict:
         "target": _hms(g["target_seconds"]),
         "target_pace": pace_text(round(g["target_seconds"] / g["distance_km"])),
         "created_at": g["created_at"],
+        "paused": bool(g["paused_at"]),
+        "paused_at": g["paused_at"],
+        "pause_reason": g["pause_reason"],
+        "pause_until": g["pause_until"],
     }
     if progress:  # live Garmin call (slower) only when explicitly requested
         try:
@@ -476,7 +486,10 @@ class AskIn(BaseModel):
 
 @app.post("/goal/coach/ask")
 def coach_ask(body: AskIn) -> dict:
-    """Ask the OpenAI coach a free-form question, grounded in your goal/plan/readiness."""
+    """Ask the OpenAI coach a free-form question, grounded in your goal/plan/
+    readiness AND the most recent 49 prior chat turns (so the coach can follow
+    up across days). The chat history is persisted in `coach_message` and
+    trimmed to the last 50 entries (~25 exchanges)."""
     g = get_active_goal()
     if g is None:
         return JSONResponse(status_code=404, content={"error": "no active goal"})
@@ -487,6 +500,9 @@ def coach_ask(body: AskIn) -> dict:
     recent = list_planned_workouts((today - timedelta(days=7)).isoformat(), (today - timedelta(days=1)).isoformat())
     context = {
         "goal": {"distance_km": g["distance_km"], "target_seconds": g["target_seconds"]},
+        "paused": bool(g["paused_at"]),
+        "pause_reason": g["pause_reason"],
+        "pause_until": g["pause_until"],
         "today": dict(tw) if tw else None,
         "readiness": {"score": readiness.score, "status": readiness.status, "reasons": readiness.reasons},
         "recent_results": [
@@ -494,10 +510,76 @@ def coach_ask(body: AskIn) -> dict:
             for r in recent
         ],
     }
-    answer = coach_answer(context, (body.question or "")[:500])
+    question = (body.question or "")[:500]
+    # Pull the last 49 turns (leaving room for the new user message) so the
+    # coach can refer back to "what we discussed yesterday".
+    history = [
+        {"role": r["role"], "content": r["content"]}
+        for r in list_recent_coach_messages(limit=49)
+    ]
+    # Persist the user message FIRST so the conversation never desyncs even if
+    # OpenAI then fails (next ask will still see this turn).
+    add_coach_message("user", question)
+    answer = coach_answer(context, question, history=history)
     if answer is None:
         return JSONResponse(status_code=503, content={"error": "coach unavailable — set OPENAI_API_KEY and ensure the account has credits"})
-    return {"question": body.question, "answer": answer}
+    add_coach_message("assistant", answer)
+    trim_coach_messages(keep=50)
+    return {"question": question, "answer": answer}
+
+
+@app.get("/goal/coach/history")
+def coach_history(limit: int = 50) -> dict:
+    """Return the persisted coach chat in chronological order (oldest first)."""
+    rows = list_recent_coach_messages(limit=max(1, min(limit, 200)))
+    return {
+        "messages": [
+            {"role": r["role"], "content": r["content"], "created_at": r["created_at"]}
+            for r in rows
+        ]
+    }
+
+
+@app.delete("/goal/coach/history")
+def coach_history_clear() -> dict:
+    """Clear the persisted coach chat."""
+    clear_coach_messages()
+    return {"status": "cleared"}
+
+
+class PauseIn(BaseModel):
+    reason: str | None = None
+    until: str | None = None  # ISO date YYYY-MM-DD; null = indefinite
+
+
+@app.post("/goal/pause")
+def goal_pause(body: PauseIn) -> dict:
+    """Pause the active goal — morning auto-adapt + auto-push to Garmin are
+    skipped while paused (a snapshot is still recorded so the trend keeps a
+    continuous baseline). Optional `until` ISO date auto-resumes on that day."""
+    if get_active_goal() is None:
+        return JSONResponse(status_code=404, content={"error": "no active goal"})
+    reason = (body.reason or "").strip()[:200] or None
+    until = (body.until or "").strip() or None
+    if until:
+        try:
+            date.fromisoformat(until)
+        except ValueError:
+            return JSONResponse(status_code=400, content={"error": f"invalid until date: {until!r} (use YYYY-MM-DD)"})
+    pause_active_goal(reason, until)
+    return {"status": "paused", "reason": reason, "until": until}
+
+
+@app.post("/goal/resume")
+def goal_resume() -> dict:
+    """Resume the active goal."""
+    g = get_active_goal()
+    if g is None:
+        return JSONResponse(status_code=404, content={"error": "no active goal"})
+    if g["paused_at"] is None:
+        return {"status": "not_paused"}
+    resume_active_goal()
+    return {"status": "resumed"}
 
 
 @app.get("/openai/models")

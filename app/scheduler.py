@@ -24,6 +24,19 @@ def _morning_update() -> None:
     goal = get_active_goal()
     if goal is None:
         return
+
+    # If the plan is paused (injury / travel / illness), skip the adapt + push
+    # parts of the morning routine. Auto-resume if the user-set `pause_until`
+    # date has passed; otherwise log a sync_log row for visibility and exit
+    # early. The Garmin sync + snapshot still run so the trend stays current.
+    paused = bool(goal["paused_at"])
+    if paused and goal["pause_until"] and goal["pause_until"] < date.today().isoformat():
+        from .db import resume_active_goal as _resume
+
+        _resume()
+        paused = False
+        goal = get_active_goal()  # refresh so downstream sees paused_at=None
+
     # Suppress run-review emails from the morning sync so we don't send two
     # emails seconds apart (the morning summary below is the primary one);
     # any new run still gets analyzed and saved for the dashboard.
@@ -31,6 +44,25 @@ def _morning_update() -> None:
         run_garmin_sync(days=45, notify_analysis=False)
     except Exception as exc:
         _log_exc("run_garmin_sync", exc)
+
+    if paused:
+        # Still record today's snapshot so the progress trend is continuous,
+        # then bail out before any adapt / notify / push.
+        try:
+            from .db import add_sync_log
+
+            reason = goal["pause_reason"] or "no reason given"
+            until = goal["pause_until"] or "indefinite"
+            add_sync_log("info", f"plan paused (reason: {reason}; until: {until}); morning adapt+push skipped", 0)
+        except Exception as exc:
+            _log_exc("add_sync_log[paused]", exc)
+        try:
+            from .progress import record_snapshot
+
+            record_snapshot(goal)
+        except Exception as exc:
+            _log_exc("record_snapshot[paused]", exc)
+        return
 
     try:
         from .progress import record_snapshot

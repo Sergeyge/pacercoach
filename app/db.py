@@ -118,11 +118,28 @@ def init_db() -> None:
             )
             """
         )
-        # Migrations for columns added after initial release.
-        try:
-            conn.execute("ALTER TABLE planned_workout ADD COLUMN garmin_workout_id TEXT")
-        except sqlite3.OperationalError:
-            pass  # column already exists
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS coach_message (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        # Migrations for columns added after initial release. Each ALTER is
+        # wrapped in its own try because SQLite has no "ADD COLUMN IF NOT EXISTS".
+        for stmt in (
+            "ALTER TABLE planned_workout ADD COLUMN garmin_workout_id TEXT",
+            "ALTER TABLE goal ADD COLUMN paused_at TEXT",
+            "ALTER TABLE goal ADD COLUMN pause_reason TEXT",
+            "ALTER TABLE goal ADD COLUMN pause_until TEXT",
+        ):
+            try:
+                conn.execute(stmt)
+            except sqlite3.OperationalError:
+                pass  # column already exists
         conn.commit()
 
 
@@ -450,3 +467,68 @@ def get_latest_analysis() -> sqlite3.Row | None:
                FROM activity_analysis x JOIN activities a ON a.source_id = x.source_id
                ORDER BY a.activity_date DESC, x.created_at DESC LIMIT 1"""
         ).fetchone()
+
+
+# --- Coach chat history (persistent across days, trimmed to last N) ---
+
+
+def add_coach_message(role: str, content: str) -> int:
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO coach_message (role, content, created_at) VALUES (?, ?, ?)",
+            (role, content, _utcnow()),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def list_recent_coach_messages(limit: int = 50) -> list[sqlite3.Row]:
+    """Return the most recent N coach messages in chronological order (oldest
+    first) — that's the order an OpenAI chat completion expects."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM coach_message ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return list(reversed(rows))
+
+
+def trim_coach_messages(keep: int = 50) -> int:
+    """Delete all but the most recent `keep` messages. Returns rows removed."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM coach_message WHERE id NOT IN "
+            "(SELECT id FROM coach_message ORDER BY id DESC LIMIT ?)",
+            (keep,),
+        )
+        conn.commit()
+        return cur.rowcount or 0
+
+
+def clear_coach_messages() -> None:
+    with get_conn() as conn:
+        conn.execute("DELETE FROM coach_message")
+        conn.commit()
+
+
+# --- Plan pause / resume ---
+
+
+def pause_active_goal(reason: str | None, until: str | None) -> bool:
+    """Mark the active goal as paused. `until` is an optional ISO date — the
+    morning job auto-resumes once that date is past."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE goal SET paused_at=?, pause_reason=?, pause_until=? WHERE active=1",
+            (_utcnow(), reason, until),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def resume_active_goal() -> bool:
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE goal SET paused_at=NULL, pause_reason=NULL, pause_until=NULL WHERE active=1",
+        )
+        conn.commit()
+        return cur.rowcount > 0

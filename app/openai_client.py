@@ -104,16 +104,39 @@ def coach_adjust(context: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
 
-def coach_answer(context: dict[str, Any], question: str) -> str | None:
-    """Free-form coaching answer. None on any failure."""
+def coach_answer(
+    context: dict[str, Any],
+    question: str,
+    history: list[dict[str, str]] | None = None,
+) -> str | None:
+    """Free-form coaching answer.
+
+    `history` is the prior chat thread as a list of `{role, content}` dicts in
+    chronological order (oldest first). The system prompt and the freshly-built
+    `context` are sent on every turn so the coach always sees current state;
+    older turns carry plain text so it can refer back to "what we discussed".
+    Returns None on any failure.
+    """
     client = _client()
     if client is None:
         return None
     try:
+        system_with_context = (
+            _COACH_CHAT_SYSTEM
+            + "\n\nCurrent athlete context (refreshed every turn):\n"
+            + json.dumps(context, default=str)
+        )
+        messages: list[dict[str, str]] = [{"role": "system", "content": system_with_context}]
+        for m in history or []:
+            role = m.get("role")
+            content = m.get("content")
+            if role in ("user", "assistant") and isinstance(content, str) and content:
+                messages.append({"role": role, "content": content})
+        messages.append({"role": "user", "content": question})
         resp = _create(
             client,
             current_model(),
-            [{"role": "system", "content": _COACH_CHAT_SYSTEM}, {"role": "user", "content": json.dumps({"context": context, "question": question}, default=str)}],
+            messages,
             json_mode=False,
             max_out=1500,  # leave room for reasoning models to think + answer
             temperature=0.4,
