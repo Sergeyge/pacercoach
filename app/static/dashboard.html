@@ -329,16 +329,25 @@ function renderGoal(g){
 function renderToday(t){
   if(!t||t.error){ $("#todayKind").textContent="—"; return; }
   $("#todayDate").textContent = t.plan_date||t.date||"";
-  const rest = t.kind==="rest" || !t.distance_km;
-  $("#todayKind").textContent = rest?"Rest":(t.kind||"run");
-  $("#todayDist").textContent = rest?"":`${t.distance_km} km`;
-  $("#todayPace").textContent = rest?"":pace(t.target_pace_sec);
-  $("#todayNote").textContent = t.coach_note || t.details || "";
-  const src = t.source || t.engine || "";
-  $("#todaySource").textContent = src? (src==="adapted"||src==="openai+rules"?"AI-adapted":"rule-based"):"";
+  const paused = t.status==='paused';
+  const rest = !paused && (t.kind==="rest" || !t.distance_km);
+  if(paused){
+    $("#todayKind").textContent = "Paused";
+    $("#todayDist").textContent = "";
+    $("#todayPace").textContent = "";
+    $("#todayNote").textContent = "Plan paused — morning adapt + auto-push are skipped. The plan calendar shifts forward when you resume.";
+    $("#todaySource").textContent = "paused";
+  } else {
+    $("#todayKind").textContent = rest?"Rest":(t.kind||"run");
+    $("#todayDist").textContent = rest?"":`${t.distance_km} km`;
+    $("#todayPace").textContent = rest?"":pace(t.target_pace_sec);
+    $("#todayNote").textContent = t.coach_note || t.details || "";
+    const src = t.source || t.engine || "";
+    $("#todaySource").textContent = src? (src==="adapted"||src==="openai+rules"?"AI-adapted":"rule-based"):"";
+  }
   const rd = (t.readiness && t.readiness.status) ? t.readiness : null;
   const pill=$("#todayReadiness");
-  if(rd){ pill.style.display=""; pill.className="pill "+rd.status; pill.textContent=`Readiness ${rd.status}${rd.score!=null?" · "+rd.score:""}`; }
+  if(rd && !paused){ pill.style.display=""; pill.className="pill "+rd.status; pill.textContent=`Readiness ${rd.status}${rd.score!=null?" · "+rd.score:""}`; }
   else pill.style.display="none";
 }
 function renderWeek(w){
@@ -551,6 +560,12 @@ function _openPauseModal(){
 }
 function _closePauseModal(){ $("#pauseModal").classList.remove('show'); }
 async function pausePlan(){ _openPauseModal(); }  // exposed name for the data-act handler
+function _refreshGoalState(){
+  // After pause/resume, refresh every panel that depends on goal state.
+  api("/goal").then(renderGoal).catch(()=>{});
+  api("/goal/today").then(renderToday).catch(()=>{});
+  api("/goal/week").then(renderWeek).catch(()=>{});
+}
 async function _submitPause(){
   const reason=$("#pauseReason").value.trim();
   const until=$("#pauseUntil").value.trim();
@@ -560,7 +575,7 @@ async function _submitPause(){
     if(r.status==='paused'){
       toast('Plan paused ✓');
       _closePauseModal();
-      api("/goal").then(renderGoal);
+      _refreshGoalState();
     } else toast(r.error||'pause failed');
   }catch(e){ toast('Error: '+e.message); }
   btn.disabled=false; btn.textContent=orig;
@@ -568,8 +583,11 @@ async function _submitPause(){
 async function resumePlan(){
   try{
     const r=await api("/goal/resume",{method:"POST"});
-    toast(r.status==='resumed'?'Plan resumed ✓':r.status==='not_paused'?'Not paused':r.status);
-    api("/goal").then(renderGoal);
+    if(r.status==='resumed'){
+      const days = r.pause_days||0;
+      toast(days>0 ? `Plan resumed ✓ (calendar shifted +${days}d)` : 'Plan resumed ✓');
+    } else toast(r.status==='not_paused'?'Not paused':(r.status||'done'));
+    _refreshGoalState();
   }catch(e){ toast('Error: '+e.message); }
 }
 
