@@ -29,6 +29,9 @@ htmlcov/
 venv/
 env/
 
+# Claude Code internal state
+.claude/
+
 # IDE / OS
 .idea/
 .vscode/
