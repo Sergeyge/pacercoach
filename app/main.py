@@ -23,8 +23,8 @@ from .db import (
     list_runs,
     list_sync_log,
     mark_garmin_pushed,
+    mark_planned_paused_from,
     pause_active_goal,
-    resume_active_goal,
     set_active_goal,
     set_config,
     trim_coach_messages,
@@ -33,7 +33,7 @@ from .db import (
 from .garmin_client import GarminClientError
 from .garmin_extra import fetch_gear, fetch_last_splits
 from .garmin_metrics import fetch_fitness, fetch_recovery, fetch_snapshot
-from .goal_planner import build_and_store_plan, parse_target_time, pace_text
+from .goal_planner import build_and_store_plan, parse_target_time, pace_text, resume_active_goal_and_shift
 from .importers import parse_garmin_csv
 from .notify import current_channel, send_morning_summary
 from .openai_client import coach_answer, list_models, ping
@@ -252,14 +252,20 @@ def goal_plan(days: int = Query(21, ge=1, le=120)) -> dict:
 def goal_week() -> dict:
     """7-day picture. Today is firm (re-adapted each morning); days 2-7 are
     projections that each get finalized on their own morning."""
-    if get_active_goal() is None:
+    g = get_active_goal()
+    if g is None:
         return JSONResponse(status_code=404, content={"error": "no active goal"})
-    ensure_horizon()
+    # When paused we do NOT call ensure_horizon — we want the dashboard to
+    # show the paused state, not freshly-materialized rule days.
+    if g["paused_at"] is None:
+        ensure_horizon()
     today = date.today()
     rows = list_planned_workouts(today.isoformat(), (today + timedelta(days=6)).isoformat())
     workouts = []
     for r in rows:
-        if r["status"] == "completed":
+        if r["status"] == "paused":
+            firmness = "paused"
+        elif r["status"] == "completed":
             firmness = "done"
         elif r["plan_date"] == today.isoformat():
             firmness = "today (adapts each morning)"
@@ -556,7 +562,9 @@ class PauseIn(BaseModel):
 def goal_pause(body: PauseIn) -> dict:
     """Pause the active goal — morning auto-adapt + auto-push to Garmin are
     skipped while paused (a snapshot is still recorded so the trend keeps a
-    continuous baseline). Optional `until` ISO date auto-resumes on that day."""
+    continuous baseline). Future planned workouts are flagged status='paused'
+    so the dashboard renders them as paused instead of stale prescriptions.
+    Optional `until` ISO date auto-resumes on that day."""
     if get_active_goal() is None:
         return JSONResponse(status_code=404, content={"error": "no active goal"})
     reason = (body.reason or "").strip()[:200] or None
@@ -567,19 +575,21 @@ def goal_pause(body: PauseIn) -> dict:
         except ValueError:
             return JSONResponse(status_code=400, content={"error": f"invalid until date: {until!r} (use YYYY-MM-DD)"})
     pause_active_goal(reason, until)
-    return {"status": "paused", "reason": reason, "until": until}
+    marked = mark_planned_paused_from(date.today().isoformat())
+    return {"status": "paused", "reason": reason, "until": until, "days_marked_paused": marked}
 
 
 @app.post("/goal/resume")
 def goal_resume() -> dict:
-    """Resume the active goal."""
+    """Resume the active goal: clear pause state, shift the plan's start_date
+    forward by the days paused (so progression picks up where it left off),
+    drop paused rows, and re-materialize from today onward."""
     g = get_active_goal()
     if g is None:
         return JSONResponse(status_code=404, content={"error": "no active goal"})
     if g["paused_at"] is None:
         return {"status": "not_paused"}
-    resume_active_goal()
-    return {"status": "resumed"}
+    return resume_active_goal_and_shift()
 
 
 @app.get("/openai/models")

@@ -166,3 +166,60 @@ def materialize(plan_row: sqlite3.Row | dict[str, Any], start: date, days: int =
         distance = round(wk * KIND_RATIO[kind], 1)
         pace = paces.get(kind)
         upsert_planned_workout(ds, kind, distance, pace, details_for(kind, pace), source="rule")
+
+
+def resume_active_goal_and_shift(today: date | None = None) -> dict[str, Any]:
+    """Resume the active goal AND adjust the plan calendar to reflect the
+    time that passed paused:
+      1. Compute pause_days = today - paused_at_date
+      2. Clear the pause fields on the goal row
+      3. Delete all status='paused' workouts + any future status='planned' rows
+         (so we re-materialize them cleanly with the shifted start date)
+      4. Shift training_plan.progression.start_date forward by pause_days so
+         the weekly progression continues where it left off (week 3 day 5 stays
+         week 3 day 5 — just on later calendar dates)
+      5. Re-materialize 21 days of workouts from today
+    Returns a small status dict; returns {"status": "not_paused"} if the goal
+    wasn't actually paused.
+    """
+    from datetime import datetime, timedelta
+    from .db import (
+        clear_paused_planned,
+        delete_planned_from,
+        get_active_goal,
+        get_active_plan,
+        resume_active_goal,
+        shift_active_plan_start,
+    )
+
+    today = today or date.today()
+    g = get_active_goal()
+    if g is None or g["paused_at"] is None:
+        return {"status": "not_paused"}
+
+    # Compute calendar days paused. paused_at is an ISO UTC timestamp like
+    # 2026-05-29T03:55:12.123456Z — take just the date portion.
+    try:
+        paused_at = datetime.fromisoformat(g["paused_at"].replace("Z", "")).date()
+    except (ValueError, AttributeError):
+        paused_at = today
+    pause_days = max(0, (today - paused_at).days)
+
+    resume_active_goal()
+    clear_paused_planned()
+    # Any future 'planned' rows that snuck in (e.g. from ensure_horizon races)
+    # also need to be wiped before re-materializing on the shifted schedule.
+    # delete_planned_from also returns Garmin workout ids it found — for an
+    # already-pushed day we leave the watch alone (the user can re-push if
+    # the post-resume workout is different).
+    delete_planned_from(today.isoformat())
+    new_start = shift_active_plan_start(pause_days) if pause_days > 0 else None
+    plan_row = get_active_plan()
+    if plan_row is not None:
+        materialize(plan_row, today, days=21)
+    return {
+        "status": "resumed",
+        "pause_days": pause_days,
+        "plan_start_shifted_by_days": pause_days,
+        "new_plan_start_date": new_start,
+    }

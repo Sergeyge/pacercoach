@@ -532,3 +532,59 @@ def resume_active_goal() -> bool:
         )
         conn.commit()
         return cur.rowcount > 0
+
+
+def mark_planned_paused_from(start_date: str) -> int:
+    """Flag all status='planned' workouts from start_date forward as
+    status='paused'. Returns the number of rows marked. Used by /goal/pause
+    so the dashboard renders the rest of the week as paused, and the morning
+    job doesn't accidentally pick a paused day to adapt/push."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE planned_workout SET status='paused' "
+            "WHERE plan_date >= ? AND status='planned'",
+            (start_date,),
+        )
+        conn.commit()
+        return cur.rowcount or 0
+
+
+def clear_paused_planned() -> int:
+    """Delete all status='paused' workouts (used on resume before
+    re-materializing the plan with a shifted start_date)."""
+    with get_conn() as conn:
+        cur = conn.execute("DELETE FROM planned_workout WHERE status='paused'")
+        conn.commit()
+        return cur.rowcount or 0
+
+
+def shift_active_plan_start(days: int) -> str | None:
+    """Push the active training plan's progression.start_date forward by
+    `days` days so the weekly periodization continues from where it paused
+    rather than where the calendar marched on. Returns the new start_date
+    string or None if there's no active plan."""
+    from datetime import date as _date, timedelta
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT tp.id, tp.progression FROM training_plan tp "
+            "JOIN goal g ON g.id = tp.goal_id "
+            "WHERE g.active = 1 ORDER BY tp.id DESC LIMIT 1"
+        ).fetchone()
+        if not row:
+            return None
+        prog = json.loads(row["progression"])
+        old_start_str = prog.get("start_date")
+        if not old_start_str:
+            return None
+        try:
+            old_start = _date.fromisoformat(old_start_str)
+        except ValueError:
+            return None
+        new_start = (old_start + timedelta(days=int(days))).isoformat()
+        prog["start_date"] = new_start
+        conn.execute(
+            "UPDATE training_plan SET progression=? WHERE id=?",
+            (json.dumps(prog), row["id"]),
+        )
+        conn.commit()
+        return new_start

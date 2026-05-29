@@ -31,9 +31,16 @@ def _morning_update() -> None:
     # early. The Garmin sync + snapshot still run so the trend stays current.
     paused = bool(goal["paused_at"])
     if paused and goal["pause_until"] and goal["pause_until"] < date.today().isoformat():
-        from .db import resume_active_goal as _resume
+        # Auto-resume: clear pause AND shift the plan's start_date forward by
+        # the days paused (same logic as the manual /goal/resume endpoint) so
+        # the progression continues from where it was, not from where the
+        # calendar happens to be on this morning.
+        try:
+            from .goal_planner import resume_active_goal_and_shift
 
-        _resume()
+            resume_active_goal_and_shift()
+        except Exception as exc:
+            _log_exc("auto_resume_with_shift", exc)
         paused = False
         goal = get_active_goal()  # refresh so downstream sees paused_at=None
 

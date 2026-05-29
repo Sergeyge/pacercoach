@@ -344,10 +344,16 @@ function renderToday(t){
 function renderWeek(w){
   if(!w||!w.workouts){ $("#week").textContent="—"; return; }
   $("#week").innerHTML = w.workouts.map(x=>{
+    const paused = x.status==="paused";
     const rest = x.kind==="rest"||!x.distance_km;
-    const fb = x.firmness&&x.firmness.startsWith("today")?'<span class="badge">today</span>':(x.status==="done"||x.status==="completed")?'<span class="badge done">done</span>':'<span class="badge proj">'+ (x.firmness==="adjusted"?"adj":"proj") +'</span>';
-    const v = rest?'<span class="v muted">—</span>':`<span class="v">${x.distance_km}km · ${pace(x.target_pace_sec)}</span>`;
-    return `<div class="wk"><span class="d">${dow(x.date)}</span><span class="k ${rest?'rest':''}">${rest?'Rest':x.kind}${fb}</span>${v}</div>`;
+    let fb;
+    if (paused) fb='<span class="badge" style="background:rgba(255,180,40,.18);color:#ffb428;border:1px solid rgba(255,180,40,.35)">paused</span>';
+    else if (x.firmness&&x.firmness.startsWith("today")) fb='<span class="badge">today</span>';
+    else if (x.status==="done"||x.status==="completed") fb='<span class="badge done">done</span>';
+    else fb='<span class="badge proj">'+ (x.firmness==="adjusted"?"adj":"proj") +'</span>';
+    const kindLabel = paused ? 'Paused' : (rest ? 'Rest' : x.kind);
+    const v = paused ? '<span class="v muted">—</span>' : (rest?'<span class="v muted">—</span>':`<span class="v">${x.distance_km}km · ${pace(x.target_pace_sec)}</span>`);
+    return `<div class="wk"><span class="d">${dow(x.date)}</span><span class="k ${rest||paused?'rest':''}">${kindLabel}${fb}</span>${v}</div>`;
   }).join("");
 }
 function renderReadiness(r){
