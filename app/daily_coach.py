@@ -211,3 +211,165 @@ def adapt_today(today: date | None = None, use_live_metrics: bool = True) -> dic
         "engine": "openai+rules" if isinstance(ai, dict) else "rules-only",
         "readiness": readiness.__dict__,
     }
+
+
+# --- Coach-driven plan edits (confirm-then-apply via /goal/coach/apply) -------
+
+_EDIT_HORIZON_DAYS = 28
+
+
+def _plan_paces() -> dict[str, Any]:
+    """Pace map (easy/long/recovery/quality → sec/km) from the active plan."""
+    plan = get_active_plan()
+    if plan is None:
+        return {}
+    try:
+        return json.loads(plan["progression"]).get("paces", {}) or {}
+    except Exception:
+        return {}
+
+
+def _cap_distance_km() -> float:
+    """Upper safety bound on any single day's distance, from the plan's cap."""
+    plan = get_active_plan()
+    if plan is not None:
+        try:
+            cap = json.loads(plan["progression"]).get("cap_km")
+            if cap:
+                return float(cap)
+        except Exception:
+            pass
+    goal = get_active_goal()
+    if goal is not None:
+        return round(float(goal["distance_km"]) * 2.2, 1)
+    return 50.0
+
+
+def _validate_date(ds: Any, today: date) -> str | None:
+    """Return a validated ISO date string within the edit horizon, else None."""
+    try:
+        d = date.fromisoformat(str(ds))
+    except (TypeError, ValueError):
+        return None
+    if d < today or d > today + timedelta(days=_EDIT_HORIZON_DAYS):
+        return None
+    return d.isoformat()
+
+
+def _repush_if_needed(plan_date: str) -> dict[str, Any] | None:
+    """If a date already has a Garmin workout, delete it and push the new
+    version so the watch reflects the edit. Returns a small status dict or None
+    if nothing was pushed (web-only day)."""
+    row = get_planned_workout(plan_date)
+    if row is None:
+        return None
+    prior_id = row["garmin_workout_id"]
+    if not prior_id:
+        return None  # web-only day; morning/explicit push will handle it
+    from .db import mark_garmin_pushed
+    from .workout_publisher import (
+        delete_garmin_workout,
+        planned_activity_to_structured_workout,
+        push_workout_to_garmin,
+    )
+
+    titles = {"easy": "Easy run", "long": "Long run", "recovery": "Recovery run", "quality": "Quality run"}
+    clear_garmin_pushed(plan_date)
+    try:
+        delete_garmin_workout(str(prior_id))
+    except Exception as exc:
+        print(f"[daily_coach.apply.delete] {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+    if row["kind"] == "rest" or float(row["distance_km"] or 0) <= 0:
+        return {"date": plan_date, "garmin": "unscheduled_rest"}
+    d = date.fromisoformat(plan_date)
+    structured = planned_activity_to_structured_workout(
+        {
+            "title": titles.get(row["kind"], "Run"),
+            "distance_km": row["distance_km"],
+            "target_pace_sec": row["target_pace_sec"],
+            "details": row["details"] or "",
+            "date": plan_date,
+        },
+        workout_date=d,
+    )
+    try:
+        result = push_workout_to_garmin(structured, schedule_date=d)
+        wid = result.get("workout_id") if isinstance(result, dict) else None
+        if wid and result.get("scheduled"):
+            mark_garmin_pushed(plan_date, str(wid))
+            return {"date": plan_date, "garmin": "repushed", "workout_id": wid}
+        return {"date": plan_date, "garmin": "push_partial", "detail": result}
+    except Exception as exc:
+        print(f"[daily_coach.apply.push] {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+        return {"date": plan_date, "garmin": "push_failed", "error": str(exc)[:200]}
+
+
+def apply_plan_change(change: dict[str, Any], today: date | None = None) -> dict[str, Any]:
+    """Validate and apply a coach-proposed plan change. Bounded: only future
+    dates within the edit horizon, kinds restricted to ALLOWED_KINDS, distance
+    clamped to [0, plan cap]. Returns {status, ...} — status='applied' on
+    success, 'rejected' with a reason otherwise."""
+    today = today or date.today()
+    if get_active_goal() is None:
+        return {"status": "rejected", "reason": "no active goal"}
+    if not isinstance(change, dict):
+        return {"status": "rejected", "reason": "no change provided"}
+
+    action = str(change.get("action") or "").strip()
+    paces = _plan_paces()
+    cap = _cap_distance_km()
+
+    if action in ("adjust_day", "rest_day"):
+        ds = _validate_date(change.get("date"), today)
+        if ds is None:
+            return {"status": "rejected", "reason": f"date out of range or invalid: {change.get('date')!r}"}
+        if action == "rest_day":
+            kind, dist = "rest", 0.0
+        else:
+            kind = str(change.get("kind") or "").strip().lower()
+            if kind not in ALLOWED_KINDS:
+                # default to keeping the existing kind if the model omitted/garbled it
+                existing = get_planned_workout(ds)
+                kind = existing["kind"] if existing else "easy"
+            if kind == "rest":
+                dist = 0.0
+            else:
+                try:
+                    dist = float(change.get("distance_km"))
+                except (TypeError, ValueError):
+                    existing = get_planned_workout(ds)
+                    dist = float(existing["distance_km"]) if existing else 0.0
+                dist = max(0.0, min(round(dist, 1), cap))
+        pace = None if kind == "rest" else paces.get(kind)
+        upsert_planned_workout(
+            ds, kind, dist, pace, details_for(kind, pace),
+            source="adapted", coach_note="Adjusted via coach chat.", status="planned",
+        )
+        garmin = _repush_if_needed(ds)
+        return {"status": "applied", "action": action, "date": ds, "kind": kind, "distance_km": dist, "garmin": garmin}
+
+    if action == "swap_days":
+        d1 = _validate_date(change.get("date"), today)
+        d2 = _validate_date(change.get("date2"), today)
+        if d1 is None or d2 is None:
+            return {"status": "rejected", "reason": "both dates must be valid and within range"}
+        if d1 == d2:
+            return {"status": "rejected", "reason": "the two dates are the same"}
+        r1 = get_planned_workout(d1)
+        r2 = get_planned_workout(d2)
+        if r1 is None or r2 is None:
+            return {"status": "rejected", "reason": "one of the dates has no planned workout"}
+        # swap kind/distance/pace/details, mark both adapted
+        upsert_planned_workout(
+            d1, r2["kind"], r2["distance_km"], r2["target_pace_sec"], r2["details"],
+            source="adapted", coach_note="Swapped via coach chat.", status="planned",
+        )
+        upsert_planned_workout(
+            d2, r1["kind"], r1["distance_km"], r1["target_pace_sec"], r1["details"],
+            source="adapted", coach_note="Swapped via coach chat.", status="planned",
+        )
+        g1 = _repush_if_needed(d1)
+        g2 = _repush_if_needed(d2)
+        return {"status": "applied", "action": "swap_days", "date": d1, "date2": d2, "garmin": [g1, g2]}
+
+    return {"status": "rejected", "reason": f"unknown action: {action!r}"}

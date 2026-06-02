@@ -115,6 +115,12 @@
   .msg.user{align-self:flex-end;background:rgba(200,251,80,.10);border:1px solid var(--volt-dim);color:var(--ink)}
   .msg.assistant{align-self:flex-start;background:#0c0e0b;border:1px solid var(--line);color:var(--ink)}
   .msg .ts{display:block;font-size:10px;color:var(--muted);margin-top:4px;font-family:JetBrains Mono;letter-spacing:1px;text-transform:uppercase}
+  .change-card{align-self:flex-start;max-width:88%;background:linear-gradient(180deg,rgba(200,251,80,.07),rgba(200,251,80,.03));border:1px solid var(--volt-dim);border-radius:14px;padding:14px 16px}
+  .change-head{display:flex;align-items:center;gap:8px;font-size:11px;letter-spacing:2px;text-transform:uppercase;color:var(--volt);font-weight:600;margin-bottom:8px}
+  .change-head .dot{width:7px;height:7px;border-radius:50%;background:var(--volt)}
+  .change-summary{font-size:14px;line-height:1.5;color:var(--ink);margin-bottom:12px}
+  .change-actions{display:flex;gap:8px;align-items:center}
+  .change-actions button{padding:7px 14px;font-size:12px}
   .pause-banner{display:flex;align-items:center;gap:10px;padding:10px 14px;background:rgba(255,180,40,.10);border:1px solid rgba(255,180,40,.35);border-radius:10px;font-size:13px;margin-bottom:12px}
   .pause-banner .dot{width:8px;height:8px;border-radius:50%;background:#ffb428;flex:0 0 auto}
   /* modal */
@@ -541,7 +547,39 @@ async function askCoach(){
     thinking.remove();
     if(r.answer) _appendMsg('assistant', r.answer, new Date().toISOString());
     else _appendMsg('assistant', r.error||'no answer', new Date().toISOString());
+    if(r.proposed_change) _appendChangeCard(r.proposed_change);
   }catch(e){ thinking.remove(); _appendMsg('assistant', 'error: '+e.message, new Date().toISOString()); }
+}
+function _appendChangeCard(change){
+  const t=$("#chatThread"); if(!t||!change) return;
+  const summary=_escapeHtml(change.summary || (change.action||'plan change'));
+  const card=document.createElement('div');
+  card.className='change-card';
+  card.innerHTML=`
+    <div class="change-head"><span class="dot"></span>Proposed plan change</div>
+    <div class="change-summary">${summary}</div>
+    <div class="change-actions">
+      <button class="change-apply">Apply change</button>
+      <button class="ghost change-dismiss">Dismiss</button>
+    </div>`;
+  t.appendChild(card); t.scrollTop=t.scrollHeight;
+  const applyBtn=card.querySelector('.change-apply');
+  const dismissBtn=card.querySelector('.change-dismiss');
+  dismissBtn.addEventListener('click',()=>{ card.remove(); });
+  applyBtn.addEventListener('click',async()=>{
+    applyBtn.disabled=true; dismissBtn.disabled=true; applyBtn.textContent='Applying…';
+    try{
+      const res=await api("/goal/coach/apply",{method:"POST",body:{change}});
+      if(res.status==='applied'){
+        card.querySelector('.change-actions').innerHTML='<span style="color:var(--volt);font-size:13px;font-weight:600">✓ Applied</span>';
+        toast('Plan updated ✓');
+        _refreshGoalState();
+      } else {
+        applyBtn.disabled=false; dismissBtn.disabled=false; applyBtn.textContent='Apply change';
+        toast('✗ '+(res.reason||'could not apply'));
+      }
+    }catch(e){ applyBtn.disabled=false; dismissBtn.disabled=false; applyBtn.textContent='Apply change'; toast('Error: '+e.message); }
+  });
 }
 async function clearChat(){
   if(!confirm('Clear the entire coach chat history? This cannot be undone.')) return;

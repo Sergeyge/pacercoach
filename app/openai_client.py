@@ -29,8 +29,23 @@ _SYSTEM_PROMPT = (
 _COACH_CHAT_SYSTEM = (
     "You are the athlete's personal running coach. Answer their question briefly and "
     "practically (2-4 sentences) using the provided context: their goal, today's planned "
-    "workout, recent results, and readiness. Be encouraging but honest. Do not invent data "
-    "you weren't given; if you can't answer from the context, say so."
+    "workout, the upcoming week, recent results, and readiness. Be encouraging but honest. "
+    "Do not invent data you weren't given; if you can't answer from the context, say so.\n\n"
+    "You can ALSO change the training plan when the athlete asks you to (e.g. 'make today "
+    "easier', 'move my long run to Sunday', 'I need a rest day today', 'shorten Friday'). "
+    "When — and only when — the athlete is clearly asking to change a specific day, include "
+    "a `proposed_change` describing it. Otherwise set proposed_change to null.\n\n"
+    "Allowed actions:\n"
+    "- adjust_day: change one day's kind and/or distance. Fields: date (YYYY-MM-DD), "
+    "kind (one of rest|recovery|easy|long|quality), distance_km (number; 0 for rest).\n"
+    "- rest_day: turn one day into rest. Fields: date.\n"
+    "- swap_days: swap the workouts of two dates. Fields: date, date2.\n"
+    "Only propose changes to dates within the upcoming plan you were given. Keep changes "
+    "sensible and conservative (never spike volume). Always describe the change in `summary` "
+    "in one short sentence, and explain it in `answer` too.\n\n"
+    "Respond with ONLY a JSON object: {\"answer\": str, \"proposed_change\": null | "
+    "{\"action\": str, \"date\": str, \"date2\": str|null, \"kind\": str|null, "
+    "\"distance_km\": number|null, \"summary\": str}}."
 )
 
 
@@ -108,14 +123,17 @@ def coach_answer(
     context: dict[str, Any],
     question: str,
     history: list[dict[str, str]] | None = None,
-) -> str | None:
-    """Free-form coaching answer.
+) -> dict[str, Any] | None:
+    """Coaching answer, optionally with a proposed plan change.
 
     `history` is the prior chat thread as a list of `{role, content}` dicts in
     chronological order (oldest first). The system prompt and the freshly-built
     `context` are sent on every turn so the coach always sees current state;
     older turns carry plain text so it can refer back to "what we discussed".
-    Returns None on any failure.
+
+    Returns `{"answer": str, "proposed_change": dict|None}` or None on failure.
+    The proposed change is NOT applied here — the caller validates and applies it
+    only after the athlete confirms.
     """
     client = _client()
     if client is None:
@@ -137,12 +155,19 @@ def coach_answer(
             client,
             current_model(),
             messages,
-            json_mode=False,
+            json_mode=True,
             max_out=1500,  # leave room for reasoning models to think + answer
             temperature=0.4,
         )
         content = resp.choices[0].message.content
-        return content if content and content.strip() else None
+        if not content or not content.strip():
+            return None
+        data = json.loads(content)
+        answer = data.get("answer")
+        if not answer or not str(answer).strip():
+            return None
+        pc = data.get("proposed_change")
+        return {"answer": str(answer).strip(), "proposed_change": pc if isinstance(pc, dict) else None}
     except Exception as exc:
         _log_exc("coach_answer", exc)
         return None

@@ -344,7 +344,7 @@ def goal_today_push() -> dict:
         return {"status": "skipped_rest_day", "date": ds}
     titles = {"easy": "Easy run", "long": "Long run", "recovery": "Recovery run", "quality": "Quality run"}
     workout = planned_activity_to_structured_workout(
-        {"title": titles.get(row["kind"], "Run"), "distance_km": row["distance_km"], "details": row["details"] or "", "date": ds},
+        {"title": titles.get(row["kind"], "Run"), "distance_km": row["distance_km"], "target_pace_sec": row["target_pace_sec"], "details": row["details"] or "", "date": ds},
         workout_date=date.today(),
     )
     save_workout_json(workout)
@@ -504,7 +504,11 @@ def coach_ask(body: AskIn) -> dict:
     runs = [dict(r) for r in list_runs(limit=500)]
     readiness = calculate_readiness(runs, today=today)
     recent = list_planned_workouts((today - timedelta(days=7)).isoformat(), (today - timedelta(days=1)).isoformat())
+    # Upcoming 14 days so the coach can reference real dates when proposing
+    # a plan change (move/shorten/rest a specific day).
+    upcoming = list_planned_workouts(today.isoformat(), (today + timedelta(days=13)).isoformat())
     context = {
+        "today_date": today.isoformat(),
         "goal": {"distance_km": g["distance_km"], "target_seconds": g["target_seconds"]},
         "paused": bool(g["paused_at"]),
         "pause_reason": g["pause_reason"],
@@ -514,6 +518,10 @@ def coach_ask(body: AskIn) -> dict:
         "recent_results": [
             {"date": r["plan_date"], "kind": r["kind"], "planned_km": r["distance_km"], "status": r["status"], "actual_km": r["actual_distance_km"]}
             for r in recent
+        ],
+        "upcoming_plan": [
+            {"date": r["plan_date"], "kind": r["kind"], "distance_km": r["distance_km"], "status": r["status"]}
+            for r in upcoming
         ],
     }
     question = (body.question or "")[:500]
@@ -526,12 +534,33 @@ def coach_ask(body: AskIn) -> dict:
     # Persist the user message FIRST so the conversation never desyncs even if
     # OpenAI then fails (next ask will still see this turn).
     add_coach_message("user", question)
-    answer = coach_answer(context, question, history=history)
-    if answer is None:
+    result = coach_answer(context, question, history=history)
+    if result is None:
         return JSONResponse(status_code=503, content={"error": "coach unavailable — set OPENAI_API_KEY and ensure the account has credits"})
+    answer = result.get("answer", "")
+    proposed = result.get("proposed_change")
     add_coach_message("assistant", answer)
     trim_coach_messages(keep=50)
-    return {"question": question, "answer": answer}
+    return {"question": question, "answer": answer, "proposed_change": proposed}
+
+
+class ApplyChangeIn(BaseModel):
+    change: dict
+
+
+@app.post("/goal/coach/apply")
+def coach_apply(body: ApplyChangeIn) -> dict:
+    """Apply a coach-proposed plan change (after the athlete confirms it in the
+    UI). Bounded: future dates only, kinds restricted, distance clamped to the
+    plan cap. Re-pushes to Garmin for any affected day already on the watch."""
+    if get_active_goal() is None:
+        return JSONResponse(status_code=404, content={"error": "no active goal"})
+    from .daily_coach import apply_plan_change
+
+    res = apply_plan_change(body.change or {})
+    if res.get("status") != "applied":
+        return JSONResponse(status_code=400, content=res)
+    return res
 
 
 @app.get("/goal/coach/history")
@@ -659,7 +688,7 @@ def push_goal_week(days: int = Query(7, ge=1, le=14), schedule: bool = True, for
                 delete_status = {"status": "error", "error": str(exc)[:200]}
         d = date.fromisoformat(r["plan_date"])
         workout = planned_activity_to_structured_workout(
-            {"title": titles.get(r["kind"], "Run"), "distance_km": r["distance_km"], "details": r["details"] or "", "date": r["plan_date"]},
+            {"title": titles.get(r["kind"], "Run"), "distance_km": r["distance_km"], "target_pace_sec": r["target_pace_sec"], "details": r["details"] or "", "date": r["plan_date"]},
             workout_date=d,
         )
         save_workout_json(workout)

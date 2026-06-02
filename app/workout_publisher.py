@@ -26,16 +26,35 @@ def _distance_value(km: float) -> float:
     return round(km * 1000, 1)
 
 
+def _pace_target(pace_sec: Any) -> str:
+    """Encode a per-km pace (seconds) as a neutral pace target token, or
+    'no_target' when no usable pace is given. Decoded in `_target_payload`."""
+    try:
+        s = int(pace_sec)
+    except (TypeError, ValueError):
+        return "no_target"
+    if s <= 0:
+        return "no_target"
+    return f"pace:{s}"
+
+
 def planned_activity_to_structured_workout(activity: dict[str, Any], workout_date: date | None = None) -> dict[str, Any]:
     """Convert planner output into a structured running workout object.
 
     This is our internal neutral model. It can be exported to JSON and translated
     to Garmin Connect's workout-service payload.
+
+    All run targets are PACE-based (Garmin pace.zone), derived from the planned
+    `target_pace_sec`. We deliberately never emit heart-rate-zone targets — pace
+    is the prescription the plan computes and the athlete trains by. Warm-up,
+    cool-down, and the recovery jogs inside interval sessions are left as
+    `no_target` (easy by feel) rather than pinned to a pace.
     """
     workout_date = workout_date or date.fromisoformat(activity["date"])
     title = str(activity.get("title") or "Run")
     distance_km = float(activity.get("distance_km") or 0)
     details = str(activity.get("details") or "")
+    pace_token = _pace_target(activity.get("target_pace_sec"))
 
     if distance_km <= 0:
         return {
@@ -52,8 +71,8 @@ def planned_activity_to_structured_workout(activity: dict[str, Any], workout_dat
         name = title
         steps = [
             {"name": "Warm Up", "kind": "warmup", "duration_type": "time", "duration_seconds": 600, "target": "no_target"},
-            {"name": "Tempo", "kind": "run", "repeat": 3, "duration_type": "time", "duration_seconds": 480, "target": "heart_rate_zone_4"},
-            {"name": "Recovery", "kind": "recovery", "repeat": 3, "duration_type": "time", "duration_seconds": 180, "target": "heart_rate_zone_2"},
+            {"name": "Tempo", "kind": "run", "repeat": 3, "duration_type": "time", "duration_seconds": 480, "target": pace_token},
+            {"name": "Recovery", "kind": "recovery", "repeat": 3, "duration_type": "time", "duration_seconds": 180, "target": "no_target"},
             {"name": "Cool Down", "kind": "cooldown", "duration_type": "time", "duration_seconds": 600, "target": "no_target"},
         ]
     else:
@@ -64,7 +83,7 @@ def planned_activity_to_structured_workout(activity: dict[str, Any], workout_dat
                 "kind": "run",
                 "duration_type": "distance",
                 "distance_meters": _distance_value(distance_km),
-                "target": "heart_rate_zone_2",
+                "target": pace_token,
             }
         ]
 
@@ -109,10 +128,23 @@ def _target_payload(target: str) -> tuple[dict[str, Any] | None, float | None, f
     # Garmin private APIs are not officially documented. These values mirror the
     # common Garmin Connect workout payload shape and may need adjustment if
     # Garmin changes their web API.
-    if target == "heart_rate_zone_2":
-        return {"workoutTargetTypeId": 4, "workoutTargetTypeKey": "heart.rate.zone"}, 2, 2
-    if target == "heart_rate_zone_4":
-        return {"workoutTargetTypeId": 4, "workoutTargetTypeKey": "heart.rate.zone"}, 4, 4
+    #
+    # Pace targets ("pace:<sec_per_km>") become a Garmin pace.zone with a small
+    # window around the goal pace, expressed as speeds in metres/second.
+    # targetValueOne = lower speed (the slower bound), targetValueTwo = upper
+    # speed (the faster bound). Heart-rate zones are intentionally not emitted —
+    # the plan prescribes pace, so all run targets are pace-based.
+    if target.startswith("pace:"):
+        try:
+            pace_sec = int(target.split(":", 1)[1])
+        except (ValueError, IndexError):
+            return None, None, None
+        if pace_sec <= 0:
+            return None, None, None
+        window = 8  # ± seconds per km around the goal pace
+        slow_speed = round(1000.0 / (pace_sec + window), 3)  # slower → lower m/s
+        fast_speed = round(1000.0 / max(1, pace_sec - window), 3)  # faster → higher m/s
+        return {"workoutTargetTypeId": 6, "workoutTargetTypeKey": "pace.zone"}, slow_speed, fast_speed
     return None, None, None
 
 
@@ -138,7 +170,7 @@ def to_garmin_workout_payload(workout: dict[str, Any]) -> dict[str, Any]:
                     "targetType": target_type,
                     "targetValueOne": target_low,
                     "targetValueTwo": target_high,
-                    "zoneNumber": target_low,
+                    "zoneNumber": None,  # pace.zone targets don't use a zone number
                 }
             )
             order += 1

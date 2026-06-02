@@ -130,6 +130,7 @@ def _morning_update() -> None:
             {
                 "title": _TITLES.get(workout["kind"], "Run"),
                 "distance_km": workout["distance_km"],
+                "target_pace_sec": workout.get("target_pace_sec"),
                 "details": workout.get("details", ""),
                 "date": today.isoformat(),
             },
