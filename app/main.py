@@ -384,7 +384,7 @@ def garmin_calendar_month(year: int = Query(...), month0: int = Query(..., ge=0,
         from .garmin_client import get_garmin_client
 
         client = get_garmin_client()
-        return client.garth.connectapi(f"/calendar-service/year/{year}/month/{month0}") or {}
+        return client.connectapi(f"/calendar-service/year/{year}/month/{month0}") or {}
     except GarminClientError as exc:
         return JSONResponse(status_code=400, content={"error": str(exc)[:200]})
 
@@ -396,10 +396,11 @@ def schedule_existing_workout(workout_id: str, date_iso: str = Query(..., alias=
         from .garmin_client import get_garmin_client
 
         client = get_garmin_client()
-        resp = client.garth.connectapi(
+        resp = client.client.post(
+            "connectapi",
             f"/workout-service/schedule/{workout_id}",
-            method="POST",
             json={"date": date_iso},
+            api=True,
         )
         return {"ok": True, "workout_id": workout_id, "date": date_iso, "response": resp}
     except GarminClientError as exc:

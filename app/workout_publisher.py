@@ -225,7 +225,7 @@ def delete_garmin_workout(workout_id: str) -> dict[str, Any]:
     except WorkoutPublishError as exc:
         return {"status": "error", "error": str(exc)}
     try:
-        client.garth.connectapi(f"/workout-service/workout/{workout_id}", method="DELETE")
+        client.client.delete("connectapi", f"/workout-service/workout/{workout_id}", api=True)
         return {"status": "ok", "workout_id": workout_id}
     except Exception as exc:
         return {"status": "error", "workout_id": workout_id, "error": str(exc)[:200]}
@@ -238,11 +238,13 @@ def push_workout_to_garmin(workout: dict[str, Any], schedule_date: date | None =
     client = _login_garmin()
     payload = to_garmin_workout_payload(workout)
 
-    # Garmin Connect private web API via the community garth session.
-    # client.garth.connectapi() targets https://connectapi.garmin.com, attaches the
-    # OAuth token, returns parsed JSON, and raises on a non-2xx response.
+    # Garmin Connect private web API via the community client. In garminconnect
+    # 0.3.x, connectapi() is GET-only; writes go through the low-level
+    # client.client.post/delete("connectapi", path, ...). These target
+    # https://connectapi.garmin.com, attach the OAuth token, and (api=True)
+    # return parsed JSON, raising on a non-2xx response.
     try:
-        created = client.garth.connectapi("/workout-service/workout", method="POST", json=payload)
+        created = client.client.post("connectapi", "/workout-service/workout", json=payload, api=True)
     except Exception as exc:
         raise WorkoutPublishError(f"Garmin workout create failed: {exc}") from exc
 
@@ -260,10 +262,11 @@ def push_workout_to_garmin(workout: dict[str, Any], schedule_date: date | None =
         # runs anyway. Log so an operator can see it; callers should also check
         # `result["scheduled"]` before treating the day as fully pushed.
         try:
-            client.garth.connectapi(
+            client.client.post(
+                "connectapi",
                 f"/workout-service/schedule/{workout_id}",
-                method="POST",
                 json={"date": schedule_date.isoformat()},
+                api=True,
             )
             scheduled = True
         except Exception as exc:

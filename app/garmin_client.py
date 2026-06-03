@@ -38,25 +38,17 @@ def get_garmin_client():
         prompt_mfa=lambda: settings.garmin_mfa_code or input("Garmin MFA code: "),
     )
 
-    token_dir = str(_TOKEN_DIR)
-    if _TOKEN_DIR.exists():
-        try:
-            client.login(token_dir)  # load cached tokens; no SSO call
-            return client
-        except Exception:
-            pass  # tokens expired/invalid → fall through to fresh login
-
-    client.login()  # full SSO login (rate-limited if called too often)
-    # Persist tokens for the next call so we never hit SSO again. We log dump
-    # errors instead of swallowing them so the cause is debuggable.
+    # garminconnect 0.3.x: login(tokenstore) both LOADS cached tokens if the
+    # directory holds valid ones AND auto-persists fresh tokens to it after a
+    # full SSO login (it calls the internal garth client.dump()). So a single
+    # login(token_dir) call covers both the fast path (reuse tokens, no SSO)
+    # and the slow path (SSO once, then cache) — no manual dump needed.
     import sys
 
+    token_dir = str(_TOKEN_DIR)
     try:
         _TOKEN_DIR.mkdir(parents=True, exist_ok=True)
-        (_TOKEN_DIR / "_mkdir_ok").write_text("ok")
-        client.garth.dump(token_dir)
-        (_TOKEN_DIR / "_dump_ok").write_text("ok")
-        print(f"[garmin_client] tokens cached at {token_dir}", file=sys.stderr, flush=True)
     except Exception as exc:
-        print(f"[garmin_client] token cache failed: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+        print(f"[garmin_client] token dir mkdir failed: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+    client.login(token_dir)
     return client
