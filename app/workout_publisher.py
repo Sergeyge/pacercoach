@@ -71,8 +71,14 @@ def planned_activity_to_structured_workout(activity: dict[str, Any], workout_dat
         name = title
         steps = [
             {"name": "Warm Up", "kind": "warmup", "duration_type": "time", "duration_seconds": 600, "target": "no_target"},
-            {"name": "Tempo", "kind": "run", "repeat": 3, "duration_type": "time", "duration_seconds": 480, "target": pace_token},
-            {"name": "Recovery", "kind": "recovery", "repeat": 3, "duration_type": "time", "duration_seconds": 180, "target": "no_target"},
+            {
+                "kind": "repeat",
+                "repeat": 3,
+                "steps": [
+                    {"name": "Tempo", "kind": "run", "duration_type": "time", "duration_seconds": 480, "target": pace_token},
+                    {"name": "Recovery", "kind": "recovery", "duration_type": "time", "duration_seconds": 180, "target": "no_target"},
+                ],
+            },
             {"name": "Cool Down", "kind": "cooldown", "duration_type": "time", "duration_seconds": 600, "target": "no_target"},
         ]
     else:
@@ -119,9 +125,12 @@ def _step_type(kind: str) -> dict[str, Any]:
 
 
 def _end_condition(step: dict[str, Any]) -> tuple[dict[str, Any], float | None]:
+    # Garmin condition type ids: 1=lap.button, 2=time, 3=distance, 4=calories,
+    # 7=iterations. Garmin resolves the numeric id (not the key), so a wrong id
+    # silently relabels the step's duration unit on the watch.
     if step.get("duration_type") == "distance":
         return {"conditionTypeId": 3, "conditionTypeKey": "distance", "displayOrder": 3, "displayable": True}, float(step["distance_meters"])
-    return {"conditionTypeId": 4, "conditionTypeKey": "time", "displayOrder": 4, "displayable": True}, float(step.get("duration_seconds", 0))
+    return {"conditionTypeId": 2, "conditionTypeKey": "time", "displayOrder": 2, "displayable": True}, float(step.get("duration_seconds", 0))
 
 
 def _target_payload(target: str) -> tuple[dict[str, Any] | None, float | None, float | None]:
@@ -148,35 +157,76 @@ def _target_payload(target: str) -> tuple[dict[str, Any] | None, float | None, f
     return None, None, None
 
 
-def to_garmin_workout_payload(workout: dict[str, Any]) -> dict[str, Any]:
-    steps = []
-    order = 1
-    for step in workout.get("steps", []):
+def _executable_step(step: dict[str, Any], order: int, child_step_id: int | None) -> dict[str, Any]:
+    end_condition, end_value = _end_condition(step)
+    target_type, target_low, target_high = _target_payload(str(step.get("target") or "no_target"))
+    return {
+        "type": "ExecutableStepDTO",
+        "stepId": None,
+        "stepOrder": order,
+        "childStepId": child_step_id,
+        "description": step.get("name"),
+        "stepType": _step_type(str(step.get("kind") or "run")),
+        "endCondition": end_condition,
+        "endConditionValue": end_value,
+        "preferredEndConditionUnit": None,
+        "targetType": target_type,
+        "targetValueOne": target_low,
+        "targetValueTwo": target_high,
+        "zoneNumber": None,  # pace.zone targets don't use a zone number
+    }
+
+
+def _estimated_duration_seconds(steps: list[dict[str, Any]]) -> float:
+    total = 0.0
+    for step in steps:
         repeat = int(step.get("repeat") or 1)
-        for _ in range(repeat):
-            end_condition, end_value = _end_condition(step)
-            target_type, target_low, target_high = _target_payload(str(step.get("target") or "no_target"))
-            steps.append(
-                {
-                    "type": "ExecutableStepDTO",
+        if step.get("kind") == "repeat":
+            total += repeat * _estimated_duration_seconds(step.get("steps") or [])
+        else:
+            total += repeat * float(step.get("duration_seconds") or 0)
+    return total
+
+
+def to_garmin_workout_payload(workout: dict[str, Any]) -> dict[str, Any]:
+    order = 1
+    group_id = 0
+
+    def build(source_steps: list[dict[str, Any]], child_step_id: int | None = None) -> list[dict[str, Any]]:
+        # stepOrder is a single pre-order sequence across the whole workout,
+        # including steps nested inside repeat groups — that sequence is what
+        # Garmin executes, so interleaving (e.g. tempo/recovery) must happen
+        # here, not by flattening repeats consecutively.
+        nonlocal order, group_id
+        built: list[dict[str, Any]] = []
+        for step in source_steps:
+            if step.get("kind") == "repeat":
+                group_id += 1
+                iterations = int(step.get("repeat") or 1)
+                group = {
+                    "type": "RepeatGroupDTO",
                     "stepId": None,
                     "stepOrder": order,
-                    "childStepId": None,
-                    "description": step.get("name"),
-                    "stepType": _step_type(str(step.get("kind") or "run")),
-                    "endCondition": end_condition,
-                    "endConditionValue": end_value,
-                    "preferredEndConditionUnit": None,
-                    "targetType": target_type,
-                    "targetValueOne": target_low,
-                    "targetValueTwo": target_high,
-                    "zoneNumber": None,  # pace.zone targets don't use a zone number
+                    "childStepId": group_id,
+                    "stepType": {"stepTypeId": 6, "stepTypeKey": "repeat", "displayOrder": 6},
+                    "numberOfIterations": iterations,
+                    "smartRepeat": False,
+                    "endCondition": {"conditionTypeId": 7, "conditionTypeKey": "iterations", "displayOrder": 7, "displayable": False},
+                    "endConditionValue": float(iterations),
                 }
-            )
-            order += 1
+                order += 1
+                group["workoutSteps"] = build(step.get("steps") or [], child_step_id=group_id)
+                built.append(group)
+            else:
+                for _ in range(int(step.get("repeat") or 1)):
+                    built.append(_executable_step(step, order, child_step_id))
+                    order += 1
+        return built
+
+    steps = build(workout.get("steps", []))
 
     estimated_distance = float(workout.get("planned_distance_km") or 0) * 1000
-    estimated_duration = sum(float(s.get("duration_seconds") or 0) * int(s.get("repeat") or 1) for s in workout.get("steps", []))
+    estimated_duration = _estimated_duration_seconds(workout.get("steps", []))
     payload = {
         "workoutId": None,
         "ownerId": None,
