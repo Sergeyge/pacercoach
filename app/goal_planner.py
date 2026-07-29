@@ -191,10 +191,20 @@ def derive_paces(goal_pace_sec: int) -> dict[str, int | None]:
 
 
 def _base_weekly_km(runs: list[dict[str, Any]], today: date) -> float:
-    cutoff = today - timedelta(days=28)
-    total = sum(r["distance_km"] for r in runs if str(r["activity_date"]) >= cutoff.isoformat())
+    """Starting weekly volume, anchored on where the athlete actually is.
+
+    The 4-week average alone under-shoots when the athlete is trending up
+    (early light weeks dilute it), so the last 7 days set the anchor —
+    discounted 10% as spike protection and capped at 1.35x the 4-week
+    average so one big week can't set an unsafe start. A light recent week
+    never drags the start below the 4-week average."""
+    week_cutoff = (today - timedelta(days=7)).isoformat()
+    month_cutoff = (today - timedelta(days=28)).isoformat()
+    last7 = sum(r["distance_km"] for r in runs if str(r["activity_date"]) >= week_cutoff)
+    total = sum(r["distance_km"] for r in runs if str(r["activity_date"]) >= month_cutoff)
     avg = total / 4 if total else 0.0
-    return round(max(15.0, avg), 1)  # never start below a sane floor
+    base = max(avg, min(last7 * 0.9, avg * 1.35)) if avg else 0.0
+    return round(max(15.0, base), 1)  # never start below a sane floor
 
 
 def weekly_volume(base: float, week_index: int, prog: dict[str, Any]) -> float:
