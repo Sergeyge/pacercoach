@@ -126,6 +126,17 @@
   .roadmap tr.current td{background:rgba(200,251,80,.05)}
   .roadmap tr.done td{color:var(--muted)}
   .roadmap td.phname{text-transform:capitalize;font-weight:600;white-space:nowrap}
+  /* stacked phase list — shown instead of the table on small screens */
+  .roadmap-list{display:none;margin-top:10px}
+  .ph-item{padding:12px 10px;border-bottom:1px dashed rgba(255,255,255,.06);border-left:2px solid transparent}
+  .ph-item:last-child{border-bottom:none}
+  .ph-item.current{border-left-color:var(--volt);background:linear-gradient(90deg,rgba(200,251,80,.06),transparent 70%);border-radius:0 10px 10px 0}
+  .ph-item.done{opacity:.55}
+  .ph-line{display:flex;align-items:center;gap:8px}
+  .ph-line .ph-name{font-weight:600;text-transform:capitalize;font-size:15px}
+  .ph-line .ph-vol{margin-left:auto;font-family:"JetBrains Mono";font-size:13px;color:var(--volt);white-space:nowrap}
+  .ph-sub{font-family:"JetBrains Mono";font-size:12px;color:var(--muted);margin-top:4px}
+  .ph-focus{font-size:13px;color:var(--muted);line-height:1.5;margin-top:4px}
   /* readiness */
   .score{font-family:"Anton";font-size:64px;line-height:1}
   .reasons{color:var(--muted);font-size:13px;line-height:1.6;margin-top:8px}
@@ -236,6 +247,12 @@
     #chatThread{max-height:50vh}
     .wk .d{width:44px}
     #gate .box{padding:26px 20px}
+    /* roadmap: swap the wide table for the stacked list; tighter bar labels */
+    .roadmap-table{display:none}
+    .roadmap-list{display:block}
+    .phasebar{height:32px}
+    .phasebar .seg{min-width:30px}
+    .phasebar .seg span{font-size:9px;letter-spacing:.5px}
     /* pause modal becomes a bottom sheet */
     .modal-backdrop{align-items:flex-end}
     .modal{width:100%;border-radius:20px 20px 0 0;padding:22px 20px calc(24px + env(safe-area-inset-bottom));transform:translateY(24px)}
@@ -480,14 +497,25 @@ function renderRoadmap(d){
     d.phases.map(p=>`<div class="seg ${p.status}" style="flex:${p.weeks}"><span>${_escapeHtml(p.name)}</span></div>`).join('')+
     (herePct!=null?`<div class="here" style="left:${herePct}%"></div>`:'')+
     `</div>`;
+  const shortDate = iso => { try{ return new Date(iso+"T00:00:00").toLocaleDateString(undefined,{month:'short',day:'numeric'}); }catch(_){ return iso; } };
   const rows = d.phases.map(p=>{
     const kmr = p.weekly_km_min===p.weekly_km_max ? `${p.weekly_km_min}` : `${p.weekly_km_min}–${p.weekly_km_max}`;
     const now = p.status==='current' ? ' <span class="badge">now</span>' : (p.status==='done' ? ' <span class="badge done">done</span>' : '');
     return `<tr class="${p.status}"><td class="phname">${_escapeHtml(p.name)}${now}</td><td class="mono">${_escapeHtml(p.start)} → ${_escapeHtml(p.end)}</td><td class="mono">${p.weeks}w</td><td class="mono">${kmr} km</td><td style="min-width:220px">${_escapeHtml(p.focus||'')}</td></tr>`;
   }).join('');
+  const items = d.phases.map(p=>{
+    const kmr = p.weekly_km_min===p.weekly_km_max ? `${p.weekly_km_min}` : `${p.weekly_km_min}–${p.weekly_km_max}`;
+    const now = p.status==='current' ? ' <span class="badge">now</span>' : (p.status==='done' ? ' <span class="badge done">done</span>' : '');
+    return `<div class="ph-item ${p.status}">
+      <div class="ph-line"><span class="ph-name">${_escapeHtml(p.name)}</span>${now}<span class="ph-vol">${kmr} km/wk</span></div>
+      <div class="ph-sub">${_escapeHtml(shortDate(p.start))} – ${_escapeHtml(shortDate(p.end))} · ${p.weeks} weeks</div>
+      <div class="ph-focus">${_escapeHtml(p.focus||'')}</div>
+    </div>`;
+  }).join('');
   el.classList.remove('muted');
   el.innerHTML = `<div class="roadmap-pos">${pos}</div>${bar}
-    <div class="roadmap-table"><table><tr><th>Phase</th><th>Dates</th><th>Len</th><th>Weekly vol</th><th>Focus</th></tr>${rows}</table></div>`;
+    <div class="roadmap-table"><table><tr><th>Phase</th><th>Dates</th><th>Len</th><th>Weekly vol</th><th>Focus</th></tr>${rows}</table></div>
+    <div class="roadmap-list">${items}</div>`;
 }
 function renderReadiness(r){
   if(!r||r.error){ $("#readiness").textContent="—"; return; }
