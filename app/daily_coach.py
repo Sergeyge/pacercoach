@@ -36,24 +36,58 @@ def _morning_metrics() -> dict[str, Any]:
     training_readiness, chronic 429) doesn't silently feed `metrics={}` to the
     LLM every morning."""
     try:
-        from .garmin_metrics import fetch_recovery
+        from .garmin_metrics import _summarize_recovery, fetch_recovery
 
         m = (fetch_recovery() or {}).get("metrics", {}) or {}
-        tr = m.get("training_readiness")
-        if isinstance(tr, list) and tr:
-            tr = tr[0]
-        hrv = (m.get("hrv") or {}).get("hrvSummary") or {}
-        sleep = (m.get("sleep") or {}).get("dailySleepDTO") or {}
-        return {
-            "garmin_training_readiness": (tr or {}).get("score") if isinstance(tr, dict) else None,
-            "hrv_status": hrv.get("status"),
-            "sleep_score": (sleep.get("sleepScores") or {}).get("overall", {}).get("value")
-            if isinstance(sleep.get("sleepScores"), dict)
-            else None,
-        }
+        # Full compact summary (readiness score+level, HRV status+ms, sleep
+        # score+hours, stress, body battery, resting HR) — the same shape the
+        # dashboard snapshot uses. Drop nulls to keep the LLM context tight.
+        summary = _summarize_recovery(
+            m.get("training_readiness"),
+            m.get("hrv"),
+            m.get("sleep"),
+            m.get("stress"),
+            m.get("body_battery"),
+            m.get("resting_heart_rate"),
+        )
+        return {k: v for k, v in summary.items() if v is not None}
     except Exception as exc:
         print(f"[daily_coach._morning_metrics] {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
         return {}
+
+
+def _week_ahead(today: date, days: int = 7) -> list[dict[str, Any]]:
+    """The upcoming planned days (tomorrow onward) so the morning coach can
+    keep the week balanced — e.g. stay light the day before the long run."""
+    start = (today + timedelta(days=1)).isoformat()
+    end = (today + timedelta(days=days)).isoformat()
+    return [
+        {"date": r["plan_date"], "kind": r["kind"], "distance_km": r["distance_km"], "status": r["status"]}
+        for r in list_planned_workouts(start, end)
+    ]
+
+
+def _this_week(today: date, plan, prog: dict[str, Any]) -> dict[str, Any]:
+    """Mon-Sun volume picture: the plan's target for this week vs. what's
+    planned and already completed."""
+    week_start = today - timedelta(days=today.weekday())
+    rows = list_planned_workouts(week_start.isoformat(), (week_start + timedelta(days=6)).isoformat())
+    out = {
+        "week_start": week_start.isoformat(),
+        "planned_km": round(sum(float(r["distance_km"] or 0) for r in rows), 1),
+        "completed_km": round(
+            sum(float(r["actual_distance_km"] or 0) for r in rows if r["status"] == "completed"), 1
+        ),
+    }
+    try:
+        from .goal_planner import weekly_volume
+
+        plan_start = date.fromisoformat(prog["start_date"])
+        week_index = max(0, (today - plan_start).days // 7)
+        out["target_km"] = weekly_volume(float(plan["base_weekly_km"]), week_index, prog)
+    except Exception as exc:
+        print(f"[daily_coach._this_week] {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+    return out
 
 
 def _recent_results(today: date, days: int = 7) -> list[dict[str, Any]]:
@@ -143,10 +177,10 @@ def adapt_today(today: date | None = None, use_live_metrics: bool = True) -> dic
         return None
 
     link_actuals(today)
+    # Always ensure the horizon exists (not just when today is missing) so the
+    # week-ahead context below has real rows to show the coach.
+    ensure_horizon(today)
     base = get_planned_workout(ds)
-    if base is None:
-        ensure_horizon(today)
-        base = get_planned_workout(ds)
     if base is None:
         return None
     base = dict(base)
@@ -162,11 +196,15 @@ def adapt_today(today: date | None = None, use_live_metrics: bool = True) -> dic
     suggestion, bounds = _rule_adjust(base, paces, readiness, recent, phase_ctx)
 
     context = {
-        "goal": {"distance_km": goal["distance_km"], "target_seconds": goal["target_seconds"]},
+        "today_date": ds,
+        "goal": {"distance_km": goal["distance_km"], "target_seconds": goal["target_seconds"], "race_date": goal["race_date"]},
         "long_term_plan": phase_ctx or "no phased roadmap (plan predates phase support)",
         "today_planned": {"kind": base["kind"], "distance_km": base["distance_km"], "target_pace_sec": base["target_pace_sec"]},
         "rule_suggestion": suggestion,
         "safety_bounds": bounds,
+        "plan_paces_sec_per_km": paces,
+        "this_week": _this_week(today, plan, prog),
+        "week_ahead": _week_ahead(today),
         "readiness": {"score": readiness.score, "status": readiness.status, "reasons": readiness.reasons},
         "morning_metrics": metrics,
         "recent_results": recent,
