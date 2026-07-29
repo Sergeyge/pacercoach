@@ -135,6 +135,7 @@ def init_db() -> None:
             "ALTER TABLE goal ADD COLUMN paused_at TEXT",
             "ALTER TABLE goal ADD COLUMN pause_reason TEXT",
             "ALTER TABLE goal ADD COLUMN pause_until TEXT",
+            "ALTER TABLE goal ADD COLUMN race_date TEXT",
         ):
             try:
                 conn.execute(stmt)
@@ -215,12 +216,12 @@ def list_sync_log(limit: int = 20) -> list[sqlite3.Row]:
 # --- Goal-driven training plan ---------------------------------------------
 
 
-def set_active_goal(distance_km: float, target_seconds: int) -> int:
+def set_active_goal(distance_km: float, target_seconds: int, race_date: str | None = None) -> int:
     with get_conn() as conn:
         conn.execute("UPDATE goal SET active = 0 WHERE active = 1")
         cur = conn.execute(
-            "INSERT INTO goal (distance_km, target_seconds, active, created_at) VALUES (?, ?, 1, ?)",
-            (distance_km, target_seconds, _utcnow()),
+            "INSERT INTO goal (distance_km, target_seconds, active, created_at, race_date) VALUES (?, ?, 1, ?, ?)",
+            (distance_km, target_seconds, _utcnow(), race_date),
         )
         conn.commit()
         return int(cur.lastrowid)

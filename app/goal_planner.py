@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 from datetime import date, timedelta
 from typing import Any
@@ -21,6 +22,126 @@ _DETAILS = {
     "quality": "Warm up 10 min, then tempo work (e.g. 3 x 8 min) near goal pace, cool down 10 min.",
     "rest": "Rest day — optional 20–30 min strength / mobility.",
 }
+
+# --- Long-term periodization (base → build → peak → taper) -------------------
+
+PHASE_ORDER = ["base", "build", "peak", "taper"]
+
+PHASE_FOCUS = {
+    "base": "Aerobic foundation — easy volume and strides; build the engine.",
+    "build": "Race-specific quality — tempo and intervals at goal pace on a growing base.",
+    "peak": "Highest load — longest long runs and race-pace sessions.",
+    "taper": "Volume drops, a touch of intensity stays — arrive at race day fresh.",
+}
+
+# Quality-day prescription varies by phase (base stays light, taper stays short).
+_PHASE_QUALITY = {
+    "base": "Warm up 10 min, then 6-8 x 20s relaxed strides with full recovery; keep the rest easy.",
+    "build": "Warm up 10 min, then tempo work (e.g. 3 x 8 min) near goal pace, cool down 10 min.",
+    "peak": "Warm up 10 min, then race-pace intervals (e.g. 4-5 x 6 min at goal pace), cool down 10 min.",
+    "taper": "Warm up 10 min, then 2 x 5 min at goal pace — short and controlled, just staying sharp.",
+}
+
+
+def default_total_weeks(distance_km: float) -> int:
+    """Plan length when no race date is given: 10K→10w, half→14w, marathon→16w."""
+    if distance_km <= 12:
+        return 10
+    if distance_km <= 30:
+        return 14
+    return 16
+
+
+def split_phase_weeks(total_weeks: int) -> dict[str, int]:
+    """Distribute total weeks across phases (~40/30/20% + 1-2 week taper)."""
+    total = max(4, int(total_weeks))
+    taper = 1 if total <= 11 else 2
+    peak = max(1, round(total * 0.2))
+    build = max(1, round(total * 0.3))
+    base = total - build - peak - taper
+    if base < 1:
+        build = max(1, build + base - 1)
+        base = total - build - peak - taper
+    return {"base": base, "build": build, "peak": peak, "taper": taper}
+
+
+def compute_phases(start: date, total_weeks: int) -> list[dict[str, Any]]:
+    weeks = split_phase_weeks(total_weeks)
+    phases: list[dict[str, Any]] = []
+    w = 0
+    for name in PHASE_ORDER:
+        n = weeks[name]
+        if n <= 0:
+            continue
+        phases.append(
+            {
+                "name": name,
+                "start_week": w,
+                "weeks": n,
+                "start": (start + timedelta(weeks=w)).isoformat(),
+                "end": (start + timedelta(weeks=w + n, days=-1)).isoformat(),
+                "focus": PHASE_FOCUS[name],
+            }
+        )
+        w += n
+    return phases
+
+
+def phase_for_week(phases: list[dict[str, Any]], week_index: int) -> dict[str, Any] | None:
+    for ph in phases or []:
+        if ph["start_week"] <= week_index < ph["start_week"] + ph["weeks"]:
+            return ph
+    return None
+
+
+def phase_context(prog: dict[str, Any], today: date) -> dict[str, Any] | None:
+    """Where the athlete stands in the long-term plan. None for plans created
+    before phase support (they have no 'phases' in progression)."""
+    phases = prog.get("phases")
+    if not phases:
+        return None
+    try:
+        plan_start = date.fromisoformat(prog["start_date"])
+    except (KeyError, ValueError):
+        return None
+    week_index = max(0, (today - plan_start).days // 7)
+    total_weeks = int(prog.get("total_weeks") or (phases[-1]["start_week"] + phases[-1]["weeks"]))
+    ph = phase_for_week(phases, week_index)
+    if ph is None:  # past race day — report as the last week of taper
+        ph = phases[-1]
+        week_index = min(week_index, total_weeks - 1)
+    race_date = prog.get("race_date")
+    if race_date:
+        try:
+            weeks_to_race = max(0, round((date.fromisoformat(race_date) - today).days / 7))
+        except ValueError:
+            weeks_to_race = max(0, total_weeks - week_index)
+    else:
+        weeks_to_race = max(0, total_weeks - week_index)
+    return {
+        "race_date": race_date,
+        "total_weeks": total_weeks,
+        "current_week": week_index + 1,
+        "weeks_to_race": weeks_to_race,
+        "phase": ph["name"],
+        "phase_week": week_index - ph["start_week"] + 1,
+        "phase_weeks": ph["weeks"],
+        "phase_focus": ph["focus"],
+    }
+
+
+def active_phase_context(today: date | None = None) -> dict[str, Any] | None:
+    """phase_context for the active plan (None if no plan / pre-phase plan)."""
+    from .db import get_active_plan
+
+    plan = get_active_plan()
+    if plan is None:
+        return None
+    try:
+        prog = json.loads(plan["progression"])
+    except (TypeError, ValueError):
+        return None
+    return phase_context(prog, today or date.today())
 
 
 def parse_target_time(value: str | int | float) -> int:
@@ -49,8 +170,11 @@ def pace_text(pace_sec: int | None) -> str:
     return f"{pace_sec // 60}:{pace_sec % 60:02d} min/km"
 
 
-def details_for(kind: str, pace_sec: int | None) -> str:
-    base = _DETAILS.get(kind, "")
+def details_for(kind: str, pace_sec: int | None, phase: str | None = None) -> str:
+    if kind == "quality" and phase in _PHASE_QUALITY:
+        base = _PHASE_QUALITY[phase]
+    else:
+        base = _DETAILS.get(kind, "")
     p = pace_text(pace_sec)
     return f"{base} Target {p}.".strip() if p else base
 
@@ -74,19 +198,45 @@ def _base_weekly_km(runs: list[dict[str, Any]], today: date) -> float:
 
 
 def weekly_volume(base: float, week_index: int, prog: dict[str, Any]) -> float:
+    phases = prog.get("phases") or []
+    ph = phase_for_week(phases, week_index)
+    if ph is None and phases and week_index >= phases[-1]["start_week"]:
+        ph = phases[-1]  # past race day — keep prescribing taper-level volume
+    if ph and ph["name"] == "taper":
+        # Taper is relative to the volume reached at the end of peak: ~65% of
+        # peak, dropping to ~45% on race week.
+        peak_week = max(0, ph["start_week"] - 1)
+        peak_vol = min(base * ((1 + prog["weekly_increase"]) ** peak_week), prog["cap_km"])
+        weeks_to_race = ph["start_week"] + ph["weeks"] - week_index
+        vol = peak_vol * (0.45 if weeks_to_race <= 1 else 0.65)
+        return round(vol * 2) / 2
     vol = base * ((1 + prog["weekly_increase"]) ** week_index)
     down_every = prog.get("down_week_every")
     if down_every and (week_index + 1) % down_every == 0:
         vol *= prog.get("down_factor", 0.85)
-    vol = min(vol, prog["cap_km"])
+    cap = prog["cap_km"] * (0.85 if ph and ph["name"] == "base" else 1.0)
+    vol = min(vol, cap)
     return round(vol * 2) / 2  # nearest 0.5 km
 
 
-def build_and_store_plan(goal_id: int, distance_km: float, target_seconds: int, runs: list[dict[str, Any]], today: date | None = None) -> dict[str, Any]:
+def build_and_store_plan(
+    goal_id: int,
+    distance_km: float,
+    target_seconds: int,
+    runs: list[dict[str, Any]],
+    today: date | None = None,
+    race_date: date | None = None,
+) -> dict[str, Any]:
     today = today or date.today()
     goal_pace = round(target_seconds / distance_km)
     paces = derive_paces(goal_pace)
     base = _base_weekly_km(runs, today)
+    if race_date is not None:
+        total_weeks = max(4, math.ceil((race_date - today).days / 7))
+    else:
+        total_weeks = default_total_weeks(distance_km)
+        race_date = today + timedelta(weeks=total_weeks)
+    phases = compute_phases(today, total_weeks)
     progression = {
         "weekly_increase": 0.07,
         "down_week_every": 4,
@@ -95,6 +245,9 @@ def build_and_store_plan(goal_id: int, distance_km: float, target_seconds: int, 
         "start_date": today.isoformat(),
         "goal_pace_sec": goal_pace,
         "paces": paces,
+        "race_date": race_date.isoformat(),
+        "total_weeks": total_weeks,
+        "phases": phases,
     }
     plan_id = save_plan(goal_id, base, WEEKDAY_TEMPLATE, progression)
 
@@ -138,6 +291,9 @@ def build_and_store_plan(goal_id: int, distance_km: float, target_seconds: int, 
         "base_weekly_km": base,
         "peak_weekly_km": progression["cap_km"],
         "paces": {k: pace_text(v) for k, v in paces.items() if v},
+        "race_date": race_date.isoformat(),
+        "total_weeks": total_weeks,
+        "phases": [{"name": p["name"], "weeks": p["weeks"], "start": p["start"], "end": p["end"]} for p in phases],
     }
 
 
@@ -165,7 +321,68 @@ def materialize(plan_row: sqlite3.Row | dict[str, Any], start: date, days: int =
         wk = weekly_volume(base, week_index, prog)
         distance = round(wk * KIND_RATIO[kind], 1)
         pace = paces.get(kind)
-        upsert_planned_workout(ds, kind, distance, pace, details_for(kind, pace), source="rule")
+        ph = phase_for_week(prog.get("phases") or [], week_index)
+        upsert_planned_workout(ds, kind, distance, pace, details_for(kind, pace, ph["name"] if ph else None), source="rule")
+
+
+def plan_phase_overview(today: date | None = None) -> dict[str, Any]:
+    """The full long-term picture for the dashboard roadmap: every phase with
+    dates, weekly-volume range and status (done/current/upcoming), plus where
+    the athlete currently stands (week X of Y, weeks to race)."""
+    from .db import get_active_goal, get_active_plan
+
+    today = today or date.today()
+    goal = get_active_goal()
+    plan = get_active_plan()
+    if goal is None or plan is None:
+        return {"phases": [], "message": "no active goal"}
+    try:
+        prog = json.loads(plan["progression"])
+    except (TypeError, ValueError):
+        return {"phases": [], "message": "plan progression unreadable"}
+    phases = prog.get("phases") or []
+    if not phases:
+        return {
+            "phases": [],
+            "message": "This plan predates phase support — set the goal again (add your race day) to generate a phased roadmap.",
+        }
+    base = float(plan["base_weekly_km"])
+    ctx = phase_context(prog, today) or {}
+    try:
+        plan_start = date.fromisoformat(prog["start_date"])
+    except (KeyError, ValueError):
+        plan_start = today
+    out_phases = []
+    for ph in phases:
+        vols = [weekly_volume(base, w, prog) for w in range(ph["start_week"], ph["start_week"] + ph["weeks"])]
+        # Dates derived from start_date + start_week (not the stored absolute
+        # dates) so a pause/resume start-date shift keeps the roadmap aligned.
+        ph_start = plan_start + timedelta(weeks=ph["start_week"])
+        ph_end = ph_start + timedelta(weeks=ph["weeks"], days=-1)
+        if today > ph_end:
+            status = "done"
+        elif today < ph_start:
+            status = "upcoming"
+        else:
+            status = "current"
+        out_phases.append(
+            {
+                "name": ph["name"],
+                "start": ph_start.isoformat(),
+                "end": ph_end.isoformat(),
+                "weeks": ph["weeks"],
+                "focus": ph["focus"],
+                "weekly_km_min": min(vols),
+                "weekly_km_max": max(vols),
+                "status": status,
+            }
+        )
+    return {
+        "start_date": prog.get("start_date"),
+        "goal": {"distance_km": goal["distance_km"], "target_seconds": goal["target_seconds"]},
+        **ctx,
+        "phases": out_phases,
+    }
 
 
 def resume_active_goal_and_shift(today: date | None = None) -> dict[str, Any]:

@@ -33,7 +33,14 @@ from .db import (
 from .garmin_client import GarminClientError
 from .garmin_extra import fetch_gear, fetch_last_splits
 from .garmin_metrics import fetch_fitness, fetch_recovery, fetch_snapshot
-from .goal_planner import build_and_store_plan, parse_target_time, pace_text, resume_active_goal_and_shift
+from .goal_planner import (
+    active_phase_context,
+    build_and_store_plan,
+    pace_text,
+    parse_target_time,
+    plan_phase_overview,
+    resume_active_goal_and_shift,
+)
 from .importers import parse_garmin_csv
 from .notify import current_channel, send_morning_summary
 from .openai_client import coach_answer, list_models, ping
@@ -175,23 +182,36 @@ def garmin_fitness(target_date: date | None = Query(None, alias="date")) -> dict
 class GoalIn(BaseModel):
     distance_km: float
     target_time: str  # "H:MM:SS", "MM:SS", or seconds
+    race_date: str | None = None  # ISO date; anchors the phased roadmap (optional)
 
 
 @app.post("/goal")
 def set_goal(body: GoalIn) -> dict:
-    """Define the running goal and build + store a training plan from current fitness."""
+    """Define the running goal and build + store a training plan from current fitness.
+    An optional race_date anchors the long-term phase roadmap (base→build→peak→taper);
+    without one a default plan length is used (10K→10w, half→14w, marathon→16w)."""
     try:
         target_seconds = parse_target_time(body.target_time)
     except ValueError as exc:
         return JSONResponse(status_code=400, content={"error": str(exc)})
     if body.distance_km <= 0 or target_seconds <= 0:
         return JSONResponse(status_code=400, content={"error": "distance_km and target_time must be positive"})
-    goal_id = set_active_goal(body.distance_km, target_seconds)
+    race_date = None
+    if body.race_date:
+        try:
+            race_date = date.fromisoformat(body.race_date.strip())
+        except ValueError:
+            return JSONResponse(status_code=400, content={"error": f"invalid race_date: {body.race_date!r} (use YYYY-MM-DD)"})
+        if race_date < date.today() + timedelta(days=28):
+            return JSONResponse(status_code=400, content={"error": "race_date must be at least 4 weeks away to build a phased plan"})
+        if race_date > date.today() + timedelta(days=400):
+            return JSONResponse(status_code=400, content={"error": "race_date is too far out (max ~1 year)"})
+    goal_id = set_active_goal(body.distance_km, target_seconds, race_date.isoformat() if race_date else None)
     runs = [dict(r) for r in list_runs(limit=500)]
-    summary = build_and_store_plan(goal_id, body.distance_km, target_seconds, runs)
+    summary = build_and_store_plan(goal_id, body.distance_km, target_seconds, runs, race_date=race_date)
     return {
         "status": "ok",
-        "goal": {"distance_km": body.distance_km, "target_seconds": target_seconds, "target_pace": summary["goal_pace"]},
+        "goal": {"distance_km": body.distance_km, "target_seconds": target_seconds, "target_pace": summary["goal_pace"], "race_date": summary["race_date"]},
         "plan": summary,
         "eta": estimate_eta({"distance_km": body.distance_km, "target_seconds": target_seconds}, fresh=True),
     }
@@ -218,6 +238,8 @@ def get_goal(progress: bool = False) -> dict:
         "target": _hms(g["target_seconds"]),
         "target_pace": pace_text(round(g["target_seconds"] / g["distance_km"])),
         "created_at": g["created_at"],
+        "race_date": g["race_date"],
+        "long_term": active_phase_context(),
         "paused": bool(g["paused_at"]),
         "paused_at": g["paused_at"],
         "pause_reason": g["pause_reason"],
@@ -235,6 +257,15 @@ def get_goal(progress: bool = False) -> dict:
 def delete_goal() -> dict:
     deactivate_goals()
     return {"status": "ok", "message": "active goal deactivated"}
+
+
+@app.get("/goal/phases")
+def goal_phases() -> dict:
+    """The long-term roadmap: every phase (base→build→peak→taper) with dates,
+    weekly-volume range and status, plus the athlete's current position."""
+    if get_active_goal() is None:
+        return JSONResponse(status_code=404, content={"error": "no active goal"})
+    return plan_phase_overview()
 
 
 @app.get("/goal/plan")
@@ -510,7 +541,8 @@ def coach_ask(body: AskIn) -> dict:
     upcoming = list_planned_workouts(today.isoformat(), (today + timedelta(days=13)).isoformat())
     context = {
         "today_date": today.isoformat(),
-        "goal": {"distance_km": g["distance_km"], "target_seconds": g["target_seconds"]},
+        "goal": {"distance_km": g["distance_km"], "target_seconds": g["target_seconds"], "race_date": g["race_date"]},
+        "long_term_plan": active_phase_context(today),
         "paused": bool(g["paused_at"]),
         "pause_reason": g["pause_reason"],
         "pause_until": g["pause_until"],

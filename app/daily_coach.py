@@ -15,7 +15,7 @@ from .db import (
     list_runs,
     upsert_planned_workout,
 )
-from .goal_planner import details_for, materialize
+from .goal_planner import details_for, materialize, phase_context
 from .openai_client import coach_adjust
 from .readiness import calculate_readiness
 
@@ -74,10 +74,11 @@ def _recent_results(today: date, days: int = 7) -> list[dict[str, Any]]:
     return out
 
 
-def _rule_adjust(base: dict[str, Any], paces: dict[str, Any], readiness, recent: list[dict[str, Any]]):
+def _rule_adjust(base: dict[str, Any], paces: dict[str, Any], readiness, recent: list[dict[str, Any]], phase_ctx: dict[str, Any] | None = None):
     """Deterministic guardrail workout + safe bounds for the LLM layer."""
     kind, dist, pace = base["kind"], base["distance_km"], base["target_pace_sec"]
     notes: list[str] = []
+    in_taper = bool(phase_ctx) and phase_ctx.get("phase") == "taper"
 
     if readiness.status == "red":
         kind, dist, pace = "rest", 0.0, None
@@ -90,11 +91,18 @@ def _rule_adjust(base: dict[str, Any], paces: dict[str, Any], readiness, recent:
         notes.append("volume trimmed ~20% for caution")
 
     missed_long = any(r["kind"] == "long" and r["status"] == "missed" for r in recent)
-    if missed_long and kind in ("easy", "recovery") and readiness.status == "green":
+    if missed_long and kind in ("easy", "recovery") and readiness.status == "green" and not in_taper:
         notes.append("a long run was missed this week — consider shifting it here")
 
+    if in_taper:
+        notes.append(
+            f"taper week {phase_ctx.get('phase_week')}/{phase_ctx.get('phase_weeks')} — protect freshness, never add volume"
+        )
+
     bounds = {
-        "max_distance_km": round(max(dist, base["distance_km"]) * 1.1, 1),
+        # During taper the plan is a hard ceiling — a missed session is never
+        # "made up" this close to the race.
+        "max_distance_km": round(base["distance_km"] * 1.0 if in_taper else max(dist, base["distance_km"]) * 1.1, 1),
         "allowed_kinds": ALLOWED_KINDS,
     }
     final = {
@@ -149,11 +157,13 @@ def adapt_today(today: date | None = None, use_live_metrics: bool = True) -> dic
     readiness = calculate_readiness(runs, today=today)
     metrics = _morning_metrics() if use_live_metrics else {}
     recent = _recent_results(today)
+    phase_ctx = phase_context(prog, today)
 
-    suggestion, bounds = _rule_adjust(base, paces, readiness, recent)
+    suggestion, bounds = _rule_adjust(base, paces, readiness, recent, phase_ctx)
 
     context = {
         "goal": {"distance_km": goal["distance_km"], "target_seconds": goal["target_seconds"]},
+        "long_term_plan": phase_ctx or "no phased roadmap (plan predates phase support)",
         "today_planned": {"kind": base["kind"], "distance_km": base["distance_km"], "target_pace_sec": base["target_pace_sec"]},
         "rule_suggestion": suggestion,
         "safety_bounds": bounds,

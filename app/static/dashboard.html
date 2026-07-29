@@ -109,6 +109,23 @@
   .badge{font-size:10px;letter-spacing:.5px;text-transform:uppercase;color:#10130b;background:var(--volt);border-radius:6px;padding:2px 6px;margin-left:8px}
   .badge.proj{background:transparent;color:var(--muted);border:1px solid var(--line)}
   .badge.done{background:rgba(116,224,138,.18);color:var(--green)}
+  /* training roadmap */
+  .roadmap-pos{font-size:14px;color:var(--muted);margin-bottom:14px;line-height:1.6}
+  .roadmap-pos b{color:var(--ink);font-family:"JetBrains Mono"}
+  .roadmap-pos .ph{color:var(--volt);text-transform:uppercase;font-weight:700;letter-spacing:1px}
+  .phasebar{position:relative;display:flex;gap:4px;height:36px;margin:2px 0 4px}
+  .phasebar .seg{position:relative;border-radius:8px;border:1px solid var(--line);background:#0c0e0b;display:flex;align-items:center;justify-content:center;min-width:40px;overflow:hidden}
+  .phasebar .seg span{font-size:10px;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);font-weight:600}
+  .phasebar .seg.done{background:rgba(116,224,138,.10);border-color:rgba(116,224,138,.25)}
+  .phasebar .seg.done span{color:var(--green)}
+  .phasebar .seg.current{background:var(--volt-dim);border-color:var(--volt)}
+  .phasebar .seg.current span{color:var(--volt)}
+  .phasebar .here{position:absolute;top:-6px;bottom:-6px;width:2px;background:var(--volt);border-radius:2px;box-shadow:0 0 8px rgba(200,251,80,.8);pointer-events:none}
+  .roadmap-table{overflow-x:auto;margin-top:14px}
+  .roadmap-table table{min-width:620px}
+  .roadmap tr.current td{background:rgba(200,251,80,.05)}
+  .roadmap tr.done td{color:var(--muted)}
+  .roadmap td.phname{text-transform:capitalize;font-weight:600;white-space:nowrap}
   /* readiness */
   .score{font-family:"Anton";font-size:64px;line-height:1}
   .reasons{color:var(--muted);font-size:13px;line-height:1.6;margin-top:8px}
@@ -285,6 +302,9 @@
   </section>
 
   <section class="grid">
+    <div class="card roadmap" style="grid-column:1/-1"><h2>Training Roadmap</h2>
+      <div id="roadmap" class="muted">Set a goal with your race day to see the phased plan (base → build → peak → taper) and where you are in it.</div>
+    </div>
     <div class="card"><h2>Recovery</h2><div id="recovery2" class="muted">Your morning Garmin metrics — the "why" behind today.</div><div style="margin-top:14px"><button data-act="metrics" class="ghost">Load metrics</button></div></div>
     <div class="card"><h2>Fitness</h2><div id="fitness" class="muted">VO₂max · training status · race prediction. Loads with Recovery.</div></div>
     <div class="card"><h2>7-Day Plan</h2><div id="week" class="muted">…</div></div>
@@ -318,6 +338,8 @@
         </select>
         <label>Target time (H:MM:SS)</label>
         <input id="gTime" class="mono" value="2:00:00">
+        <label>Race day — optional, anchors the phase roadmap</label>
+        <input id="gRace" type="date" style="color-scheme:dark">
         <button type="submit">Set goal</button>
       </form>
     </div>
@@ -378,7 +400,14 @@ function renderGoal(g){
   const km=g.distance_km;
   const label = Math.abs(km-21.0975)<2?"Half Marathon":Math.abs(km-42.195)<3?"Marathon":Math.abs(km-10)<1.5?"10K":Math.abs(km-5)<1?"5K":km+" km";
   $("#goalTitle").innerHTML = `<span class="accent">${_escapeHtml(g.target||'')}</span><br>${_escapeHtml(label)}`;
-  $("#goalMeta").innerHTML = `Target pace <b>${_escapeHtml(g.target_pace||'')}</b> · ${_escapeHtml(String(km))} km`;
+  let meta = `Target pace <b>${_escapeHtml(g.target_pace||'')}</b> · ${_escapeHtml(String(km))} km`;
+  if(g.race_date){
+    const lt=g.long_term||{};
+    meta += `<br>Race day <b>${_escapeHtml(g.race_date)}</b>`;
+    if(lt.weeks_to_race!=null) meta += ` · in <b>${lt.weeks_to_race}w</b>`;
+    if(lt.phase) meta += ` · now in <b style="color:var(--volt)">${_escapeHtml(lt.phase)}</b>`;
+  }
+  $("#goalMeta").innerHTML = meta;
   // Pause banner + action buttons
   const banner=$("#pauseBanner");
   const actions=$("#goalActions");
@@ -433,6 +462,32 @@ function renderWeek(w){
     const v = paused ? '<span class="v muted">—</span>' : (rest?'<span class="v muted">—</span>':`<span class="v">${x.distance_km}km · ${pace(x.target_pace_sec)}</span>`);
     return `<div class="wk"><span class="d">${dow(x.date)}</span><span class="k ${rest||paused?'rest':''}">${kindLabel}${fb}</span>${v}</div>`;
   }).join("");
+}
+function renderRoadmap(d){
+  const el=$("#roadmap"); if(!el) return;
+  if(!d||d.error||!(d.phases&&d.phases.length)){
+    el.innerHTML=`<span class="muted">${_escapeHtml((d&&(d.message||d.error))||'No phased plan yet — set a goal (add your race day) to see the roadmap.')}</span>`;
+    return;
+  }
+  const total = d.total_weeks || d.phases.reduce((a,p)=>a+p.weeks,0);
+  let pos='';
+  if(d.current_week!=null) pos += `Week <b>${d.current_week}</b> of <b>${total}</b>`;
+  if(d.phase) pos += ` · <span class="ph">${_escapeHtml(d.phase)}</span> week ${d.phase_week}/${d.phase_weeks}`;
+  if(d.race_date) pos += ` · race <b>${_escapeHtml(d.race_date)}</b>${d.weeks_to_race!=null?` (in ${d.weeks_to_race}w)`:''}`;
+  if(d.phase_focus) pos += `<br><span style="font-size:13px">${_escapeHtml(d.phase_focus)}</span>`;
+  const herePct = d.current_week!=null ? Math.min(99.5, Math.max(0.5, ((d.current_week-0.5)/total)*100)) : null;
+  const bar = `<div class="phasebar">`+
+    d.phases.map(p=>`<div class="seg ${p.status}" style="flex:${p.weeks}"><span>${_escapeHtml(p.name)}</span></div>`).join('')+
+    (herePct!=null?`<div class="here" style="left:${herePct}%"></div>`:'')+
+    `</div>`;
+  const rows = d.phases.map(p=>{
+    const kmr = p.weekly_km_min===p.weekly_km_max ? `${p.weekly_km_min}` : `${p.weekly_km_min}–${p.weekly_km_max}`;
+    const now = p.status==='current' ? ' <span class="badge">now</span>' : (p.status==='done' ? ' <span class="badge done">done</span>' : '');
+    return `<tr class="${p.status}"><td class="phname">${_escapeHtml(p.name)}${now}</td><td class="mono">${_escapeHtml(p.start)} → ${_escapeHtml(p.end)}</td><td class="mono">${p.weeks}w</td><td class="mono">${kmr} km</td><td style="min-width:220px">${_escapeHtml(p.focus||'')}</td></tr>`;
+  }).join('');
+  el.classList.remove('muted');
+  el.innerHTML = `<div class="roadmap-pos">${pos}</div>${bar}
+    <div class="roadmap-table"><table><tr><th>Phase</th><th>Dates</th><th>Len</th><th>Weekly vol</th><th>Focus</th></tr>${rows}</table></div>`;
 }
 function renderReadiness(r){
   if(!r||r.error){ $("#readiness").textContent="—"; return; }
@@ -666,6 +721,7 @@ function _refreshGoalState(){
   api("/goal").then(renderGoal).catch(()=>{});
   api("/goal/today").then(renderToday).catch(()=>{});
   api("/goal/week").then(renderWeek).catch(()=>{});
+  api("/goal/phases").then(renderRoadmap).catch(()=>{});
 }
 async function _submitPause(){
   const reason=$("#pauseReason").value.trim();
@@ -698,6 +754,7 @@ async function loadAll(){
     ["#goalTitle", ()=>api("/goal").then(renderGoal)],
     ["today", ()=>api("/goal/today").then(renderToday)],
     ["week", ()=>api("/goal/week").then(renderWeek)],
+    ["roadmap", ()=>api("/goal/phases").then(renderRoadmap)],
     ["readiness", ()=>api("/readiness").then(renderReadiness)],
     ["runs", ()=>api("/activities/runs?limit=8").then(renderRuns)],
     ["sync", ()=>api("/sync/status").then(renderSync)],
@@ -753,7 +810,7 @@ document.addEventListener("click",e=>{
 $("#goalForm").addEventListener("submit",async e=>{
   e.preventDefault();
   try{
-    const r=await api("/goal",{method:"POST",body:{distance_km:parseFloat($("#gDist").value),target_time:$("#gTime").value}});
+    const r=await api("/goal",{method:"POST",body:{distance_km:parseFloat($("#gDist").value),target_time:$("#gTime").value,race_date:$("#gRace").value||null}});
     if(r.status==="ok"){
       if(r.eta) renderEta(r.eta);
       toast("Goal set ✓");
