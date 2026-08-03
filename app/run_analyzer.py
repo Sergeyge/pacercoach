@@ -2,26 +2,38 @@ from __future__ import annotations
 
 import json
 import sys
-from datetime import datetime
+from datetime import date
 from typing import Any
 
 from .db import (
     get_active_goal,
+    get_active_plan,
     get_activity_analysis,
     get_conn,
+    get_planned_workout,
     list_runs,
     list_unanalyzed_running_activities,
     save_activity_analysis,
     update_activity_sent_at,
 )
+from .goal_planner import phase_context
 from .notify import analysis_email_html, send_message
 from .openai_client import _client, _create, current_model
 
 _ANALYSIS_SYSTEM = (
     "You are an expert running coach reviewing the athlete's just-completed run. "
-    "Write a concise, professional analysis (3-6 sentences) covering: pace and effort "
-    "vs the athlete's goal/target paces, what went well, any concerns (e.g. easy days "
-    "run too hard, HR drift), and one specific actionable takeaway for the next session. "
+    "Write a concise, professional analysis (3-6 sentences).\n"
+    "Judge the run against 'planned_workout' — the session the training plan prescribed "
+    "for that day (kind, distance, target pace). An easy/recovery/long run is meant to be "
+    "SLOWER than race pace: compare its pace to the planned target and 'plan_paces', and "
+    "never call a correctly-paced easy run too slow against the race-goal pace. Only "
+    "compare against the goal pace when the session itself targeted it (quality/race-pace "
+    "work). Flag the opposite problem — easy days run too hard — explicitly.\n"
+    "Cover: execution vs the planned session (kind, distance, pace), what went well, any "
+    "concerns (e.g. HR drift, easy days run too hard), and one specific actionable "
+    "takeaway for the next session. Respect 'training_phase' (base = aerobic patience, "
+    "taper = freshness over fitness) when advising. If no planned_workout is provided, "
+    "this was an unplanned run — say so and assess it on its own merits.\n"
     "Be direct, encouraging but honest. Use the numbers provided — do not invent data."
 )
 
@@ -48,7 +60,14 @@ def _fmt_duration(sec: Any) -> str | None:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
-def analyze_activity(activity: dict[str, Any], goal: Any | None = None, recent_runs: list | None = None) -> str | None:
+def analyze_activity(
+    activity: dict[str, Any],
+    goal: Any | None = None,
+    recent_runs: list | None = None,
+    planned: dict[str, Any] | None = None,
+    plan_paces: dict[str, Any] | None = None,
+    phase: dict[str, Any] | None = None,
+) -> str | None:
     """Generate a coach summary for one completed activity. Returns None on any failure."""
     client = _client()
     if client is None:
@@ -64,6 +83,19 @@ def analyze_activity(activity: dict[str, Any], goal: Any | None = None, recent_r
             "activity_type": activity.get("activity_type"),
         }
     }
+    if planned:
+        context["planned_workout"] = {
+            "kind": planned.get("kind"),
+            "distance_km": planned.get("distance_km"),
+            "target_pace": _fmt_pace(planned.get("target_pace_sec")),
+            "details": planned.get("details"),
+            "coach_note": planned.get("coach_note"),
+        }
+    if plan_paces:
+        paces = {k: _fmt_pace(v) for k, v in plan_paces.items()}
+        context["plan_paces"] = {k: v for k, v in paces.items() if v}
+    if phase:
+        context["training_phase"] = phase
     if goal:
         gp = None
         if goal.get("distance_km"):
@@ -118,6 +150,17 @@ def analyze_new_runs_and_notify(limit: int = 5, notify: bool = True) -> dict[str
     goal = dict(goal_row) if goal_row else None
     recent = [dict(r) for r in list_runs(limit=10)]
 
+    # Training-plan context so the review judges the run against the day's
+    # planned session (easy pace vs easy target) instead of the race-goal pace.
+    plan_row = get_active_plan()
+    prog: dict[str, Any] = {}
+    if plan_row is not None:
+        try:
+            prog = json.loads(plan_row["progression"]) or {}
+        except (TypeError, ValueError):
+            prog = {}
+    plan_paces = prog.get("paces") or {}
+
     for r in rows:
         activity = dict(r)
         source_id = activity["source_id"]
@@ -127,7 +170,19 @@ def analyze_new_runs_and_notify(limit: int = 5, notify: bool = True) -> dict[str
             out["results"].append({"date": activity.get("activity_date"), "status": "already_analyzed"})
             continue
         peers = [x for x in recent if x.get("source_id") != source_id]
-        summary = analyze_activity(activity, goal=goal, recent_runs=peers)
+        planned = phase = None
+        activity_date = str(activity.get("activity_date") or "")
+        if activity_date:
+            planned_row = get_planned_workout(activity_date)
+            planned = dict(planned_row) if planned_row else None
+            try:
+                phase = phase_context(prog, date.fromisoformat(activity_date)) if prog else None
+            except ValueError:
+                phase = None
+        summary = analyze_activity(
+            activity, goal=goal, recent_runs=peers,
+            planned=planned, plan_paces=plan_paces, phase=phase,
+        )
         if not summary:
             out["skipped"] += 1
             out["results"].append({"date": activity.get("activity_date"), "status": "skipped"})
