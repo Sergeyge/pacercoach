@@ -59,6 +59,8 @@
   .conn input:focus{outline:none;border-color:var(--volt)}
   .conn select{background:#0c0e0b;border:1px solid var(--line);color:var(--ink);border-radius:10px;padding:8px 10px;font-family:"JetBrains Mono";font-size:12px;max-width:180px}
   .conn select:focus{outline:none;border-color:var(--volt)}
+  .conn-sync{display:flex;align-items:center;gap:10px;border-left:1px solid var(--line);padding-left:12px}
+  .conn-sync .sync-status{font-family:"JetBrains Mono";font-size:12px}
   .dot{width:9px;height:9px;border-radius:50%;background:#444;box-shadow:0 0 0 0 rgba(200,251,80,.6)}
   .dot.on{background:var(--volt);animation:pulse 2.4s infinite}
   @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(200,251,80,.5)}70%{box-shadow:0 0 0 9px rgba(200,251,80,0)}100%{box-shadow:0 0 0 0 rgba(200,251,80,0)}}
@@ -227,6 +229,8 @@
     .conn .connlab{display:block;margin-bottom:-4px}
     .conn input,.conn select{width:100%;max-width:none}
     .conn button{width:100%}
+    .conn-sync{flex-direction:column;align-items:stretch;border-left:none;padding-left:0;border-top:1px dashed rgba(255,255,255,.08);padding-top:12px;margin-top:2px}
+    .conn-sync .connlab{margin-bottom:0}
   }
   @media(max-width:820px){.hero{grid-template-columns:1fr;gap:16px}}
   @media(max-width:640px){
@@ -280,6 +284,11 @@
     <input id="keyTop" placeholder="X-API-Key" autocomplete="off" spellcheck="false" autocapitalize="none">
     <button id="connTop" class="ghost">Reconnect</button>
     <button id="copyLink" class="ghost" title="Copy a one-click login link (open it on any device)">Copy link</button>
+    <div class="conn-sync">
+      <label class="connlab">Garmin sync</label>
+      <span id="sync" class="sync-status muted">…</span>
+      <button data-act="sync" class="ghost">Sync now</button>
+    </div>
   </div>
   <div class="topbar-tools">
     <span id="statusDot" class="dot" title="connection"></span>
@@ -342,7 +351,6 @@
       <div style="display:flex;gap:8px"><input id="askInput" placeholder="e.g. can I move my long run to Sunday?" enterkeyhint="send" style="flex:1;background:#0c0e0b;border:1px solid var(--line);color:var(--ink);border-radius:10px;padding:10px 12px;font-family:Sora;font-size:13px"><button id="askBtn">Ask</button></div>
     </div>
     <div class="card"><h2>Recent Runs</h2><div id="runs" class="muted">…</div></div>
-    <div class="card"><h2>Garmin Sync</h2><div id="sync" class="muted">…</div><div style="margin-top:14px"><button data-act="sync" class="ghost">Sync now</button></div></div>
     <div class="card"><h2>Set / Change Goal</h2>
       <div id="goalEta" class="muted" style="margin-bottom:14px;font-size:13px;line-height:1.5">…</div>
       <form id="goalForm">
@@ -425,6 +433,9 @@ function renderGoal(g){
     if(lt.phase) meta += ` · now in <b style="color:var(--volt)">${_escapeHtml(lt.phase)}</b>`;
   }
   $("#goalMeta").innerHTML = meta;
+  // Prefill the goal form's race-day with the current goal's date (only while
+  // untouched, so a refresh never clobbers an in-progress edit).
+  if(g.race_date){ const r=$("#gRace"); if(r&&!r.value) r.value=g.race_date; }
   // Pause banner + action buttons
   const banner=$("#pauseBanner");
   const actions=$("#goalActions");
@@ -532,12 +543,13 @@ function renderRuns(d){
     a.slice(0,8).map(r=>`<tr><td class="mono">${r.activity_date}</td><td class="mono">${r.distance_km}km</td><td class="mono">${pace(r.avg_pace_sec_per_km)}</td><td class="mono">${r.avg_hr||"—"}</td></tr>`).join("")+`</table>`;
 }
 function renderSync(s){
-  if(!s){ $("#sync").textContent="—"; return; }
+  const el=$("#sync");
+  if(!s){ el.textContent="—"; return; }
   const last=(s.recent_syncs&&s.recent_syncs[0])||null;
-  $("#sync").innerHTML =
-    `<div class="kv">auto-sync <b>${s.auto_sync_enabled?"on":"off"}</b></div>`+
-    `<div class="kv">interval <b>${s.sync_interval_minutes}m</b></div>`+
-    (last?`<div class="kv">last <b>${last.status}</b></div><div class="muted" style="font-size:12px;margin-top:6px">${last.message}</div>`:'<div class="muted" style="font-size:12px">no syncs yet</div>');
+  const bits=[`auto-sync ${s.auto_sync_enabled?"on":"off"}`,`every ${s.sync_interval_minutes}m`];
+  bits.push(last?`last ${last.status}`:"no syncs yet");
+  el.textContent=bits.join(" · ");
+  el.title=(last&&last.message)||"";
 }
 function renderProgress(p){
   const el=$("#progress");
