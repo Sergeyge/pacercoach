@@ -5,9 +5,13 @@ running plan, scores readiness, and pushes today's workout to your watch each
 morning. OpenAI does the daily coach-layer adaptation; a deterministic
 rule-based engine is the fallback.
 
-The dashboard (single-file HTML at `/`) shows today's plan, last run's AI
-coach review, recovery + fitness, goal progress with an LLM-driven ETA, and
-a chat with the coach.
+The dashboard (single-file HTML at `/`) shows today's plan, the phased
+Training Roadmap (base → build → peak → taper), last run's AI coach review,
+recovery + fitness, goal progress with an LLM-driven ETA, and a chat with the
+coach that can also propose plan changes (applied only after you confirm).
+The header settings panel (gear icon on mobile) holds the coach model,
+notification channel, API key / magic link, and the Garmin sync status +
+manual "Sync now".
 
 Live instance: <https://app.fanrun.app> (single user, magic-link gated).
 
@@ -151,7 +155,8 @@ Persistent state (gitignored):
 ## Daily flow
 
 At `MORNING_UPDATE_TIME` (06:00 by default, in your TZ) an in-process
-APScheduler job runs:
+APScheduler job runs (while the goal is paused, the adapt/notify/push steps
+are skipped — with auto-resume on the day after `pause_until`):
 
 1. `run_garmin_sync(days=45, notify_analysis=False)` — pulls latest activities;
    run-review analyses on new activities are saved to the DB but NOT emailed
@@ -167,18 +172,24 @@ APScheduler job runs:
    pushed — so next run retries
 
 Any failure at step 3 writes `sync_log("error", …)`, surfacing it in
-`/sync/status` and on the dashboard's Sync card.
+`/sync/status` and in the dashboard's settings-panel sync status.
 
 ## AI features
 
 ### Run review on sync
 
 When `run_garmin_sync` ingests new running activities, `analyze_new_runs_and_notify`
-queues them through the OpenAI coach for a per-activity professional summary
-(pace vs target, what went well, concerns, one takeaway). The analysis row is
-**saved BEFORE the email is sent** so the once-per-activity guarantee holds
-even if SMTP retries. The dashboard's *Last Run · AI Coach Review* card shows
-the most recent one.
+queues them through the OpenAI coach for a per-activity professional summary.
+The review is judged against the **training plan**, not just the race goal:
+the coach gets the day's planned session (kind/distance/target pace/details),
+the plan's pace map, the current phase position, and the next 7 planned days
+(with natural labels — "tomorrow", "Wednesday"). So an easy run is compared to
+its easy target instead of being called slow against race pace, and the
+takeaway names the athlete's actual next session. Runs on days with no planned
+workout are flagged as unplanned and assessed on their own merits. The
+analysis row is **saved BEFORE the email is sent** so the once-per-activity
+guarantee holds even if SMTP retries. The dashboard's *Last Run · AI Coach
+Review* card shows the most recent one.
 
 ### Goal ETA
 
@@ -190,18 +201,32 @@ explicitly instructed to cross-check Garmin predictions against the other
 signals (Garmin tends to be optimistic for longer distances). Cached 6h in
 the `app_config` table; `POST /goal` bypasses the cache.
 
-### Coach chat
+### Coach chat (with plan edits)
 
-`POST /goal/coach/ask` — free-form question, grounded in your goal + plan +
-readiness context. Returns escaped text rendered into the dashboard's "Ask
-the coach" panel.
+`POST /goal/coach/ask` — free-form question, grounded in your goal, phase
+roadmap position, today's workout, the upcoming 14 days, recent results and
+readiness, plus the persisted chat history (last ~25 exchanges, stored in
+`coach_message`). When you clearly ask for a plan change ("make today easier",
+"move my long run to Sunday"), the coach returns a `proposed_change`
+(adjust_day / rest_day / swap_days) which the dashboard renders as a
+confirm card; `POST /goal/coach/apply` validates it (future dates only,
+bounded kinds/distances) and re-pushes affected days to Garmin.
 
-### Runtime model + channel switching
+### Pause / resume
 
-The dashboard header has dropdowns for:
+`POST /goal/pause` (optional reason + auto-resume date) skips the morning
+adapt + auto-push while keeping snapshots for a continuous trend;
+`POST /goal/resume` shifts the plan's start date by the paused days and
+re-materializes from today.
+
+### Settings panel (runtime switching)
+
+The dashboard's settings panel (header; gear toggle on mobile) has:
 - **Model** (`/openai/models` lists curated common models + custom) — changes
   the active OpenAI model, persisted to the `app_config` table, no restart
 - **Notify channel** (`/config/notify`) — same idea for the notification channel
+- **Garmin sync** — compact status (auto-sync on/off · interval · last result)
+  plus a manual "Sync now" button
 
 ## API reference
 
@@ -239,15 +264,21 @@ All endpoints require `X-API-Key` except `/`, `/dashboard`, `/health`,
 
 | Method | Path | Parameters | Description |
 |---|---|---|---|
-| POST | `/goal` | `{distance_km, target_time}` | Set goal; build + store plan from current fitness; return ETA. |
-| GET | `/goal` | `progress=false` | Active goal; `?progress=true` adds Garmin race-prediction. |
+| POST | `/goal` | `{distance_km, target_time, race_date?}` | Set goal; build + store plan from current fitness; return ETA. Optional `race_date` (ISO, ≥4 weeks out) anchors the phased roadmap. |
+| GET | `/goal` | `progress=false` | Active goal incl. race date, phase position and pause state; `?progress=true` adds Garmin race-prediction. |
 | DELETE | `/goal` | — | Deactivate the active goal. |
+| GET | `/goal/phases` | — | Long-term roadmap: each phase with dates, volume range, status + current position. |
 | GET | `/goal/week` | — | 7-day picture: today firm, projected days 2–7. |
 | GET | `/goal/plan` | `days=21` | Upcoming planned workouts. |
 | GET | `/goal/progress` | `weeks=12` | Garmin race-prediction trend vs target. |
 | GET | `/goal/stats` | `days=30` | Consistency (% of run days completed + streak). |
 | GET | `/goal/eta` | `fresh=false` | LLM completion-date estimate + explanation (`?fresh=true` bypasses 6h cache). |
-| POST | `/goal/coach/ask` | `{question}` | Ask the OpenAI coach a free-form question. |
+| POST | `/goal/coach/ask` | `{question}` | Ask the coach; may return a `proposed_change` for confirmation. |
+| POST | `/goal/coach/apply` | `{change}` | Apply a confirmed coach-proposed change (bounded; re-pushes Garmin days). |
+| GET | `/goal/coach/history` | `limit=50` | Persisted coach chat, oldest first. |
+| DELETE | `/goal/coach/history` | — | Clear the persisted coach chat. |
+| POST | `/goal/pause` | `{reason?, until?}` | Pause morning adapt + auto-push; optional auto-resume date. |
+| POST | `/goal/resume` | — | Resume: shift plan start by paused days, re-materialize from today. |
 | GET | `/goal/today` | — | Today's adapted workout (cheap DB read). |
 | POST | `/goal/today/refresh` | `live=true` | Force the adaptive recompute now. |
 | POST | `/goal/today/push` | — | Push today's workout to Garmin (skips rest days). |
