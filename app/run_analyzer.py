@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 from .db import (
@@ -11,6 +11,7 @@ from .db import (
     get_activity_analysis,
     get_conn,
     get_planned_workout,
+    list_planned_workouts,
     list_runs,
     list_unanalyzed_running_activities,
     save_activity_analysis,
@@ -31,9 +32,11 @@ _ANALYSIS_SYSTEM = (
     "work). Flag the opposite problem — easy days run too hard — explicitly.\n"
     "Cover: execution vs the planned session (kind, distance, pace), what went well, any "
     "concerns (e.g. HR drift, easy days run too hard), and one specific actionable "
-    "takeaway for the next session. Respect 'training_phase' (base = aerobic patience, "
-    "taper = freshness over fitness) when advising. If no planned_workout is provided, "
-    "this was an unplanned run — say so and assess it on its own merits.\n"
+    "takeaway. Anchor the takeaway to the athlete's actual upcoming schedule in "
+    "'upcoming_days' — name the concrete next session (its day, kind, distance, target "
+    "pace), never a generic 'next run'. Respect 'training_phase' (base = aerobic "
+    "patience, taper = freshness over fitness) when advising. If no planned_workout is "
+    "provided, this was an unplanned run — say so and assess it on its own merits.\n"
     "Be direct, encouraging but honest. Use the numbers provided — do not invent data."
 )
 
@@ -67,6 +70,7 @@ def analyze_activity(
     planned: dict[str, Any] | None = None,
     plan_paces: dict[str, Any] | None = None,
     phase: dict[str, Any] | None = None,
+    upcoming: list[dict[str, Any]] | None = None,
 ) -> str | None:
     """Generate a coach summary for one completed activity. Returns None on any failure."""
     client = _client()
@@ -96,6 +100,16 @@ def analyze_activity(
         context["plan_paces"] = {k: v for k, v in paces.items() if v}
     if phase:
         context["training_phase"] = phase
+    if upcoming:
+        context["upcoming_days"] = [
+            {
+                "date": u.get("plan_date"),
+                "kind": u.get("kind"),
+                "distance_km": u.get("distance_km"),
+                "target_pace": _fmt_pace(u.get("target_pace_sec")),
+            }
+            for u in upcoming
+        ]
     if goal:
         gp = None
         if goal.get("distance_km"):
@@ -171,17 +185,27 @@ def analyze_new_runs_and_notify(limit: int = 5, notify: bool = True) -> dict[str
             continue
         peers = [x for x in recent if x.get("source_id") != source_id]
         planned = phase = None
+        upcoming: list[dict[str, Any]] = []
         activity_date = str(activity.get("activity_date") or "")
         if activity_date:
             planned_row = get_planned_workout(activity_date)
             planned = dict(planned_row) if planned_row else None
             try:
-                phase = phase_context(prog, date.fromisoformat(activity_date)) if prog else None
+                act_day = date.fromisoformat(activity_date)
             except ValueError:
-                phase = None
+                act_day = None
+            if act_day is not None:
+                phase = phase_context(prog, act_day) if prog else None
+                upcoming = [
+                    dict(u)
+                    for u in list_planned_workouts(
+                        (act_day + timedelta(days=1)).isoformat(),
+                        (act_day + timedelta(days=7)).isoformat(),
+                    )
+                ]
         summary = analyze_activity(
             activity, goal=goal, recent_runs=peers,
-            planned=planned, plan_paces=plan_paces, phase=phase,
+            planned=planned, plan_paces=plan_paces, phase=phase, upcoming=upcoming,
         )
         if not summary:
             out["skipped"] += 1
