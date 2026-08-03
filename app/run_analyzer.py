@@ -34,7 +34,9 @@ _ANALYSIS_SYSTEM = (
     "concerns (e.g. HR drift, easy days run too hard), and one specific actionable "
     "takeaway. Anchor the takeaway to the athlete's actual upcoming schedule in "
     "'upcoming_days' — name the concrete next session (its day, kind, distance, target "
-    "pace), never a generic 'next run'. Respect 'training_phase' (base = aerobic "
+    "pace), never a generic 'next run'. Refer to days naturally by their 'day' label "
+    "(e.g. 'tomorrow', 'on Wednesday'), never by raw ISO dates. Respect 'training_phase' "
+    "(base = aerobic "
     "patience, taper = freshness over fitness) when advising. If no planned_workout is "
     "provided, this was an unplanned run — say so and assess it on its own merits.\n"
     "Be direct, encouraging but honest. Use the numbers provided — do not invent data."
@@ -49,6 +51,18 @@ def _fmt_pace(pace_sec: Any) -> str | None:
     if s <= 0:
         return None
     return f"{s // 60}:{s % 60:02d}/km"
+
+
+def _day_label(ds: Any, ref: date | None) -> str | None:
+    """Natural label for a plan date relative to the reviewed run: 'tomorrow'
+    for the day right after it, else the weekday name."""
+    try:
+        d = date.fromisoformat(str(ds))
+    except (TypeError, ValueError):
+        return None
+    if ref is not None and (d - ref).days == 1:
+        return "tomorrow"
+    return d.strftime("%A")
 
 
 def _fmt_duration(sec: Any) -> str | None:
@@ -101,9 +115,14 @@ def analyze_activity(
     if phase:
         context["training_phase"] = phase
     if upcoming:
+        try:
+            run_day = date.fromisoformat(str(activity.get("activity_date")))
+        except (TypeError, ValueError):
+            run_day = None
         context["upcoming_days"] = [
             {
                 "date": u.get("plan_date"),
+                "day": _day_label(u.get("plan_date"), run_day),
                 "kind": u.get("kind"),
                 "distance_km": u.get("distance_km"),
                 "target_pace": _fmt_pace(u.get("target_pace_sec")),
