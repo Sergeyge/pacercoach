@@ -40,6 +40,8 @@ from .goal_planner import (
     parse_target_time,
     plan_phase_overview,
     resume_active_goal_and_shift,
+    row_structure,
+    title_for,
 )
 from .importers import parse_garmin_csv
 from .notify import current_channel, send_morning_summary
@@ -57,6 +59,7 @@ from .workout_publisher import (
     planned_activity_to_structured_workout,
     push_workout_to_garmin,
     save_workout_json,
+    structured_workout_for_planned_row,
     to_garmin_workout_payload,
 )
 
@@ -112,9 +115,21 @@ def activities(limit: int = 50) -> dict:
 
 
 @app.get("/readiness")
-def readiness() -> dict:
+def readiness(live: bool = False) -> dict:
+    """Readiness from training load. With `live=true` this morning's Garmin
+    recovery metrics are folded in too, which is what makes the verdict reflect
+    how you actually are rather than just how much you've been running."""
+    from .garmin_metrics import no_freshness
+
     runs = [dict(r) for r in list_runs(limit=500)]
-    return calculate_readiness(runs).__dict__
+    metrics: dict = {}
+    freshness: dict = no_freshness("live metrics not requested")
+    if live:
+        from .daily_coach import morning_metrics
+
+        metrics, freshness = morning_metrics()
+    out = calculate_readiness(runs, metrics=metrics).__dict__
+    return {**out, "metrics_freshness": freshness, "morning_metrics": metrics}
 
 
 @app.get("/plan/today")
@@ -308,6 +323,7 @@ def goal_week() -> dict:
             {
                 "date": r["plan_date"],
                 "kind": r["kind"],
+                "title": title_for(r["kind"], structure=row_structure(r, date.fromisoformat(r["plan_date"]))),
                 "distance_km": r["distance_km"],
                 "target_pace_sec": r["target_pace_sec"],
                 "firmness": firmness,
@@ -346,7 +362,10 @@ def goal_today() -> dict:
         row = get_planned_workout(ds)
     if row is None:
         return JSONResponse(status_code=404, content={"error": "no plan for today"})
-    return dict(row)
+    out = dict(row)
+    # Name the session as prescribed so the card matches the watch and the email.
+    out["title"] = title_for(out["kind"], structure=row_structure(row, date.today()))
+    return out
 
 
 @app.post("/goal/today/refresh")
@@ -373,11 +392,7 @@ def goal_today_push() -> dict:
         return JSONResponse(status_code=404, content={"error": "no plan for today"})
     if row["kind"] == "rest" or float(row["distance_km"] or 0) <= 0:
         return {"status": "skipped_rest_day", "date": ds}
-    titles = {"easy": "Easy run", "long": "Long run", "recovery": "Recovery run", "quality": "Quality run"}
-    workout = planned_activity_to_structured_workout(
-        {"title": titles.get(row["kind"], "Run"), "distance_km": row["distance_km"], "target_pace_sec": row["target_pace_sec"], "details": row["details"] or "", "date": ds},
-        workout_date=date.today(),
-    )
+    workout = structured_workout_for_planned_row(row, date.today())
     save_workout_json(workout)
     try:
         result = push_workout_to_garmin(workout, schedule_date=date.today())
@@ -392,6 +407,56 @@ def goal_today_push() -> dict:
     return result
 
 
+@app.post("/goal/today/recheck")
+def goal_today_recheck() -> dict:
+    """Re-read this morning's recovery metrics, re-adapt today from them, and put
+    the result on the watch — the "is today's session right for how I am now?"
+    action. Unlike the 06:00 job this runs whenever you ask, so it is the way to
+    realign the session if your watch synced late or you run in the evening.
+
+    Returns the workout plus `metrics_freshness`, so a recheck that found no
+    recovery data says so instead of looking like a confident verdict.
+    """
+    if get_active_goal() is None:
+        return JSONResponse(status_code=404, content={"error": "no active goal"})
+    workout = adapt_today(use_live_metrics=True)
+    if workout is None:
+        return JSONResponse(status_code=404, content={"error": "no plan for today"})
+
+    ds = workout["date"]
+    today = date.today()
+    row = get_planned_workout(ds)
+    garmin: dict | None = None
+    if workout.get("skipped"):
+        garmin = {"status": "skipped", "reason": workout["skipped"]}
+    elif row is None:
+        # adapt_today returned a workout, so the row should exist — if it doesn't,
+        # the write failed and reporting it as a rest day would hide that.
+        garmin = {"status": "error", "error": f"no planned_workout row stored for {ds}"}
+    elif row["kind"] == "rest" or float(row["distance_km"] or 0) <= 0:
+        garmin = {"status": "skipped_rest_day"}
+    elif row["garmin_workout_id"]:
+        # adapt_today unschedules the prior workout whenever kind, distance or
+        # pace changed, so a surviving id means those three are unchanged and the
+        # session is already on Garmin. A details-only rewrite keeps the id.
+        garmin = {"status": "already_pushed", "workout_id": row["garmin_workout_id"]}
+    else:
+        structured = structured_workout_for_planned_row(row, today)
+        save_workout_json(structured)
+        try:
+            result = push_workout_to_garmin(structured, schedule_date=today)
+            wid = result.get("workout_id") if isinstance(result, dict) else None
+            if wid and result.get("scheduled"):
+                mark_garmin_pushed(ds, str(wid))
+            garmin = result
+        except Exception as exc:
+            # Deliberately broad: any failure here must reach the caller as data.
+            # A network error escaping as a 500 was rendered by the dashboard as a
+            # rest day, which reads as a legitimate prescription.
+            garmin = {"status": "error", "error": f"{type(exc).__name__}: {exc}"[:200]}
+    return {**workout, "garmin": garmin}
+
+
 @app.post("/goal/today/notify")
 def goal_today_notify() -> dict:
     """Send today's workout + coaching note as a morning summary (per NOTIFY_CHANNEL)."""
@@ -404,7 +469,12 @@ def goal_today_notify() -> dict:
         row = get_planned_workout(ds)
     if row is None:
         return JSONResponse(status_code=404, content={"error": "no plan for today"})
-    return send_morning_summary(dict(row))
+    # A raw row carries no `title`, so without this the message would fall back to
+    # the bare kind label ("Quality") and contradict both the watch and the
+    # morning job's own email for the same day.
+    return send_morning_summary(
+        {**dict(row), "title": title_for(row["kind"], structure=row_structure(row, date.today()))}
+    )
 
 
 @app.get("/garmin/calendar/month")
@@ -692,7 +762,6 @@ def push_goal_week(days: int = Query(7, ge=1, le=14), schedule: bool = True, for
     ensure_horizon()
     today = date.today()
     rows = list_planned_workouts(today.isoformat(), (today + timedelta(days=days - 1)).isoformat())
-    titles = {"easy": "Easy run", "long": "Long run", "recovery": "Recovery run", "quality": "Quality run"}
     results = []
     pushed = 0
     for r in rows:
@@ -720,10 +789,7 @@ def push_goal_week(days: int = Query(7, ge=1, le=14), schedule: bool = True, for
                 )
                 delete_status = {"status": "error", "error": str(exc)[:200]}
         d = date.fromisoformat(r["plan_date"])
-        workout = planned_activity_to_structured_workout(
-            {"title": titles.get(r["kind"], "Run"), "distance_km": r["distance_km"], "target_pace_sec": r["target_pace_sec"], "details": r["details"] or "", "date": r["plan_date"]},
-            workout_date=d,
-        )
+        workout = structured_workout_for_planned_row(r, d)
         save_workout_json(workout)
         try:
             result = push_workout_to_garmin(workout, schedule_date=d if schedule else None)

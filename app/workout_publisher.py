@@ -38,7 +38,106 @@ def _pace_target(pace_sec: Any) -> str:
     return f"pace:{s}"
 
 
-def planned_activity_to_structured_workout(activity: dict[str, Any], workout_date: date | None = None) -> dict[str, Any]:
+def _shaped_steps(shape: dict[str, Any], distance_km: float, pace_token: str, pace_sec: Any) -> list[dict[str, Any]]:
+    """Build the watch steps for a quality shape (see `goal_planner.QUALITY_SHAPES`).
+
+    Two layouts, selected by the shape's `easy_body`:
+
+    * `easy_body` (a strides day) — the planned distance MINUS the timed tail is
+      run at easy pace and the reps are appended. The reps and cool-down are
+      time-based, so their distance (converted at the easy pace) is subtracted from
+      the planned total to keep overall volume on plan. Whether the reps carry the
+      pace target is `reps_at_pace`, which strides set False: they are run fast by
+      feel, and the jog recoveries are deliberately untargeted, so pinning either
+      to a pace would misrepresent the session.
+    * otherwise (tempo / intervals / sharpener) — a time-based warm-up, the reps
+      at the day's pace, then a cool-down. These are prescribed by duration, so
+      the planned distance is carried as metadata only.
+    """
+    reps = int(shape["reps"])
+    work = int(shape["work_seconds"])
+    recovery = int(shape["recovery_seconds"])
+    rep_block = {
+        "kind": "repeat",
+        "repeat": reps,
+        "steps": [
+            {
+                "name": "Stride" if shape["easy_body"] else "Work",
+                "kind": "run",
+                "duration_type": "time",
+                "duration_seconds": work,
+                "target": pace_token if shape["reps_at_pace"] else "no_target",
+            },
+            {
+                "name": "Jog recovery",
+                "kind": "recovery",
+                "duration_type": "time",
+                "duration_seconds": recovery,
+                "target": "no_target",
+            },
+        ],
+    }
+    cooldown = {
+        "name": "Cool Down",
+        "kind": "cooldown",
+        "duration_type": "time",
+        "duration_seconds": int(shape["cooldown_seconds"]),
+        "target": "no_target",
+    }
+
+    if not shape["easy_body"]:
+        return [
+            {
+                "name": "Warm Up",
+                "kind": "warmup",
+                "duration_type": "time",
+                "duration_seconds": int(shape["warmup_seconds"]),
+                "target": "no_target",
+            },
+            rep_block,
+            cooldown,
+        ]
+
+    tail_seconds = reps * (work + recovery) + int(shape["cooldown_seconds"])
+    try:
+        easy_pace = int(pace_sec)
+    except (TypeError, ValueError):
+        easy_pace = 0
+    if easy_pace > 0:
+        tail_km = tail_seconds / easy_pace
+    else:
+        # No usable pace means the tail can't be converted to distance, so the
+        # volume-conservation subtraction below would silently do nothing and the
+        # athlete would run the full planned distance plus the whole tail. Say so.
+        tail_km = 0.0
+        print(
+            f"[workout_publisher._shaped_steps] no target pace for a {shape['structure']} session; "
+            f"pushing the full {distance_km:g} km body, so total volume runs long by ~{tail_seconds / 60:.0f} min",
+            file=sys.stderr,
+            flush=True,
+        )
+    # Never shrink the easy body below 1 km — on a very short planned day the
+    # session keeps its strides and simply runs slightly longer than planned.
+    body_km = max(1.0, round(distance_km - tail_km, 2))
+    return [
+        {
+            "name": "Easy",
+            "kind": "run",
+            "duration_type": "distance",
+            "distance_meters": _distance_value(body_km),
+            "target": pace_token,
+        },
+        rep_block,
+        cooldown,
+    ]
+
+
+def planned_activity_to_structured_workout(
+    activity: dict[str, Any],
+    workout_date: date | None = None,
+    *,
+    sniff_title: bool = True,
+) -> dict[str, Any]:
     """Convert planner output into a structured running workout object.
 
     This is our internal neutral model. It can be exported to JSON and translated
@@ -49,6 +148,14 @@ def planned_activity_to_structured_workout(activity: dict[str, Any], workout_dat
     is the prescription the plan computes and the athlete trains by. Warm-up,
     cool-down, and the recovery jogs inside interval sessions are left as
     `no_target` (easy by feel) rather than pinned to a pace.
+
+    `activity["structure"]` names the session shape (see
+    `goal_planner.QUALITY_SHAPES`). The title is sniffed only as a fallback for
+    activities that carry no structure — the legacy `/workouts/*` flows, which
+    build their own dicts. Callers that resolve the shape themselves pass
+    `sniff_title=False`, so a `structure` of None means "plain steady run" rather
+    than "guess from the title": a shapeless quality day is titled "Quality run",
+    which the sniffer would otherwise read as a tempo session.
     """
     workout_date = workout_date or date.fromisoformat(activity["date"])
     title = str(activity.get("title") or "Run")
@@ -66,23 +173,30 @@ def planned_activity_to_structured_workout(activity: dict[str, Any], workout_dat
             "notes": details,
         }
 
-    lower = title.lower()
-    if "tempo" in lower or "interval" in lower or "quality" in lower:
-        name = title
-        steps = [
-            {"name": "Warm Up", "kind": "warmup", "duration_type": "time", "duration_seconds": 600, "target": "no_target"},
-            {
-                "kind": "repeat",
-                "repeat": 3,
-                "steps": [
-                    {"name": "Tempo", "kind": "run", "duration_type": "time", "duration_seconds": 480, "target": pace_token},
-                    {"name": "Recovery", "kind": "recovery", "duration_type": "time", "duration_seconds": 180, "target": "no_target"},
-                ],
-            },
-            {"name": "Cool Down", "kind": "cooldown", "duration_type": "time", "duration_seconds": 600, "target": "no_target"},
-        ]
+    from .goal_planner import QUALITY_SHAPES, SHAPES_BY_STRUCTURE
+
+    structure = str(activity.get("structure") or "").strip().lower()
+    if not structure and sniff_title:
+        lower = title.lower()
+        if "strides" in lower:
+            structure = QUALITY_SHAPES["base"]["structure"]
+        elif "interval" in lower:
+            structure = QUALITY_SHAPES["peak"]["structure"]
+        elif "tempo" in lower or "quality" in lower:
+            structure = QUALITY_SHAPES["build"]["structure"]
+
+    name = title
+    shape = SHAPES_BY_STRUCTURE.get(structure)
+    if shape:
+        steps = _shaped_steps(shape, distance_km, pace_token, activity.get("target_pace_sec"))
     else:
-        name = title
+        if structure:
+            print(
+                f"[workout_publisher] unknown session structure {structure!r}; "
+                "pushing a plain steady run",
+                file=sys.stderr,
+                flush=True,
+            )
         steps = [
             {
                 "name": title,
@@ -102,6 +216,34 @@ def planned_activity_to_structured_workout(activity: dict[str, Any], workout_dat
         "notes": details,
         "steps": steps,
     }
+
+
+def structured_workout_for_planned_row(row: Any, plan_date: date) -> dict[str, Any]:
+    """Build the watch workout for a planned_workout row (or an `adapt_today`
+    result), taking the session shape from the row so a base-phase quality day
+    becomes an easy run + strides instead of a tempo session.
+
+    Every goal-flow push path goes through here, so the session the athlete gets
+    on the watch cannot diverge between the morning job and a manual push.
+    """
+    from .goal_planner import row_structure, title_for
+
+    kind = row["kind"]
+    structure = row_structure(row, plan_date)
+    return planned_activity_to_structured_workout(
+        {
+            "title": title_for(kind, structure=structure),
+            "distance_km": row["distance_km"],
+            "target_pace_sec": row["target_pace_sec"],
+            "details": row["details"] or "",
+            "date": plan_date.isoformat(),
+            "structure": structure,
+        },
+        workout_date=plan_date,
+        # The shape is already resolved here — None genuinely means "plain steady
+        # run", so the title must not be second-guessed.
+        sniff_title=False,
+    )
 
 
 def save_workout_json(workout: dict[str, Any]) -> Path:

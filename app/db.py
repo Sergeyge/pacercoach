@@ -132,6 +132,12 @@ def init_db() -> None:
         # wrapped in its own try because SQLite has no "ADD COLUMN IF NOT EXISTS".
         for stmt in (
             "ALTER TABLE planned_workout ADD COLUMN garmin_workout_id TEXT",
+            # Session shape for the watch — one of the `structure` values in
+            # goal_planner.QUALITY_SHAPES, or NULL for a plain steady run. Stored
+            # so a push normally reads it instead of re-deriving the plan phase;
+            # rows written before this column existed still fall back through
+            # `goal_planner.row_structure`.
+            "ALTER TABLE planned_workout ADD COLUMN structure TEXT",
             "ALTER TABLE goal ADD COLUMN paused_at TEXT",
             "ALTER TABLE goal ADD COLUMN pause_reason TEXT",
             "ALTER TABLE goal ADD COLUMN pause_until TEXT",
@@ -270,17 +276,19 @@ def upsert_planned_workout(
     source: str = "rule",
     coach_note: str | None = None,
     status: str = "planned",
+    structure: str | None = None,
 ) -> None:
     with get_conn() as conn:
         conn.execute(
             """INSERT INTO planned_workout
-                 (plan_date, kind, distance_km, target_pace_sec, details, source, coach_note, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 (plan_date, kind, distance_km, target_pace_sec, details, source, coach_note, status, structure)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(plan_date) DO UPDATE SET
                  kind=excluded.kind, distance_km=excluded.distance_km,
                  target_pace_sec=excluded.target_pace_sec, details=excluded.details,
-                 source=excluded.source, coach_note=excluded.coach_note, status=excluded.status""",
-            (plan_date, kind, distance_km, target_pace_sec, details, source, coach_note, status),
+                 source=excluded.source, coach_note=excluded.coach_note, status=excluded.status,
+                 structure=excluded.structure""",
+            (plan_date, kind, distance_km, target_pace_sec, details, source, coach_note, status, structure),
         )
         conn.commit()
 

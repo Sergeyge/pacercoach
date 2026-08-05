@@ -141,6 +141,8 @@ link" button in the header regenerates this URL for sharing to a new device.
 | `OPENAI_MODEL` | Default model, runtime-overridable from the dashboard (`/config/model`) |
 | `MORNING_UPDATE_TIME` | Local-time HH:MM of the daily auto-adapt (default `06:00`) |
 | `TIMEZONE` | IANA TZ for the morning cron (default `Asia/Jerusalem`) |
+| `MORNING_RETRY_MINUTES` | Gap between retries while waiting for the watch to sync recovery data (default `20`) |
+| `MORNING_RETRY_UNTIL` | Local HH:MM to stop waiting and adapt on training load alone (default `09:00`) |
 | `GOAL_AUTO_PUSH` | `true` to also push the adapted workout to Garmin each morning |
 | `NOTIFY_CHANNEL` | `none` / `email` / `callmebot` — runtime-overridable from the dashboard |
 | `SMTP_*`, `EMAIL_*` | Gmail SMTP for the email channel |
@@ -158,21 +160,87 @@ At `MORNING_UPDATE_TIME` (06:00 by default, in your TZ) an in-process
 APScheduler job runs (while the goal is paused, the adapt/notify/push steps
 are skipped — with auto-resume on the day after `pause_until`):
 
-1. `run_garmin_sync(days=45, notify_analysis=False)` — pulls latest activities;
+1. **Freshness gate first.** `morning_metrics()` reads this morning's Garmin
+   recovery metrics and checks the calendar stamp on each post-sleep signal
+   (training readiness, sleep, HRV). Unless at least one is confirmed to be
+   *today's*, the job stops here and reschedules itself every
+   `MORNING_RETRY_MINUTES` until `MORNING_RETRY_UNTIL` — nothing below runs, so
+   no email is sent, nothing is written, and a workout already on your watch is
+   left alone. Stale, undatable and missing metrics are dropped rather than
+   scored: readiness cannot tell yesterday's sleep score from today's, so a
+   two-day-old bad night must not cancel today's session.
+2. `run_garmin_sync(days=45, notify_analysis=False)` — pulls latest activities;
    run-review analyses on new activities are saved to the DB but NOT emailed
    (to avoid double-emails seconds before the morning summary)
-2. `record_snapshot(goal)` — captures today's Garmin race-prediction
-3. `adapt_today(use_live_metrics=True)` — reads readiness, HRV, sleep, recent
-   planned-vs-actual, calls the OpenAI coach with safe bounds, falls back to
-   rules; writes the adapted workout to `planned_workout`
-4. `send_morning_summary(workout)` — emails the day's workout + coach note
-   (via Gmail SMTP, CallMeBot WhatsApp, or skipped per `NOTIFY_CHANNEL`)
-5. Auto-pushes the adapted workout to Garmin (skipped on rest days). On
+3. `record_snapshot(goal)` — captures today's Garmin race-prediction
+4. `adapt_today(recovery=…)` — scores readiness from the verified metrics plus
+   training load, calls the OpenAI coach with safe bounds, falls back to rules;
+   writes the adapted workout to `planned_workout`. A day already marked
+   completed is returned untouched.
+5. `send_morning_summary(workout)` — emails the day's session name, prescription
+   and coach note (via Gmail SMTP, CallMeBot WhatsApp, or skipped per
+   `NOTIFY_CHANNEL`)
+6. Auto-pushes the adapted workout to Garmin (skipped on rest days). On
    schedule failure, writes a `sync_log("warn", …)` row and does NOT mark
    pushed — so next run retries
 
-Any failure at step 3 writes `sync_log("error", …)`, surfacing it in
-`/sync/status` and in the dashboard's settings-panel sync status.
+At the cutoff the job proceeds regardless and the coach note names the actual
+cause — watch not synced, data from an earlier day, unconfirmable, or Garmin
+refusing the requests (which needs re-authorising, not a re-sync). The retry
+chain is also capped at whatever fits the window, with an absolute ceiling of 48
+attempts so a misconfigured interval can't loop.
+
+Retries live only in memory, so once the routine completes it records the date in
+`app_config`; a restart inside the retry window with that marker unset schedules a
+one-off catch-up. The catch-up is bounded by the same cutoff and skips completed
+days, so an evening deploy can't send a "this morning" email or schedule a
+workout for a day you've already run.
+
+Readiness is only physiological when verified metrics are present; otherwise the
+score reflects training load alone and both the dashboard and the coach note say
+so. The dashboard's **Check my condition** button (`POST /goal/today/recheck`)
+re-reads the metrics on demand, re-adapts and re-pushes — use it when your watch
+syncs late or you run in the evening.
+
+**Only today is ever pushed to the watch.** The 7-day panel is a projection you
+look at; each day is finalized and pushed on its own morning. (`POST
+/goal/week/push` can push a range on demand, but nothing calls it — there is no
+button and the scheduler never uses it.)
+
+### What the coach may change
+
+The OpenAI layer is bounded by the rules, not trusted over them. It can never
+prescribe a **harder** session than the rules did, and on a morning readiness
+didn't flag it cannot change the session type at all — only tune volume within a
+band.
+
+| Bound | Readiness green (nothing eased) | Volume eased (yellow, type kept) | Type eased (yellow demotion / red) |
+|---|---|---|---|
+| `allowed_kinds` | the planned kind only, plus `long` if a long run was missed | `rest` or the planned kind — shorten it or call the day off, but don't swap it | only kinds at or below the eased one; `['rest']` alone on red |
+| `min_distance_km` | 70% of planned — shortened, not cancelled | `0` | `0` |
+| `max_distance_km` | 110% of planned, raised to this week's long-run distance when a missed long run is offered; the plan's own distance during taper | the eased distance | the eased distance |
+| pace | always the plan's pace for the chosen kind | same | same |
+
+Kinds are ranked `rest < recovery < easy < long < quality`, and when readiness
+changes the type that ranking becomes the ceiling. So a peak-phase interval
+session becomes an easy run on a yellow morning and full rest on a red one, and
+the coach can go further down but not back up. A base-phase strides day is
+different: it already runs at easy pace, so readiness trims its volume without
+changing its type, and the type stays locked.
+
+The pace is never taken from the coach — it is the prescription for a kind, and
+accepting it separately let an "easy" day be run at threshold. A zero distance on
+a run kind is normalised to `rest` rather than stored as an incoherent
+"quality, 0 km", which every push path would have treated as a rest day anyway.
+
+Anything the bounds reject is replaced by the plan's value, and the coach's prose
+and note are replaced along with it, so the stored day never describes a change
+that didn't happen. Every rejection is logged. A coach that thinks you shouldn't
+train says so in the note; cancelling a session requires readiness to justify it.
+
+A failure reading the metrics (step 1) or adapting (step 4) writes
+`sync_log("error", …)`, surfacing it in `/sync/status` and in the dashboard's
+settings-panel sync status.
 
 ## AI features
 
@@ -255,7 +323,7 @@ All endpoints require `X-API-Key` except `/`, `/dashboard`, `/health`,
 
 | Method | Path | Parameters | Description |
 |---|---|---|---|
-| GET | `/readiness` | — | Readiness score/status from stored load (acute vs. 4-week). |
+| GET | `/readiness` | `live=false` | Readiness score/status from stored load (acute vs. 4-week); `live=true` folds in this morning's Garmin recovery metrics. |
 | GET | `/plan/today` | `goal=general_fitness`, `today` | Today's recommended session. |
 | GET | `/plan/week` | `target_distance_km`, `goal`, `start_date` | 7-day plan. |
 | GET | `/assistant/context` | — | Readiness + recent runs + today & week plans bundled. |
@@ -281,9 +349,10 @@ All endpoints require `X-API-Key` except `/`, `/dashboard`, `/health`,
 | POST | `/goal/resume` | — | Resume: shift plan start by paused days, re-materialize from today. |
 | GET | `/goal/today` | — | Today's adapted workout (cheap DB read). |
 | POST | `/goal/today/refresh` | `live=true` | Force the adaptive recompute now. |
+| POST | `/goal/today/recheck` | — | Re-read this morning's recovery metrics, re-adapt today from them, and push the result to the watch. Reports `metrics_freshness`. |
 | POST | `/goal/today/push` | — | Push today's workout to Garmin (skips rest days). |
 | POST | `/goal/today/notify` | — | Send today's workout via the configured channel. |
-| POST | `/goal/week/push` | `days=7`, `force=false` | Push next N days to Garmin; `force=true` deletes old then re-pushes. |
+| POST | `/goal/week/push` | `days=7`, `force=false` | Push next N days to Garmin; `force=true` deletes old then re-pushes. API-only — no UI, and the morning job never calls it. |
 
 ### Live Garmin metrics
 
@@ -355,6 +424,30 @@ entries on your watch.
 If workout creation succeeds but scheduling fails, the result includes
 `schedule_error` — the morning job writes a `sync_log("warn", …)` and does
 NOT call `mark_garmin_pushed`, so the next run will retry.
+
+Quality days are defined once in `goal_planner.QUALITY_SHAPES`: the prose the
+athlete reads, the day's target pace and the steps pushed to the watch are all
+derived from the same entry, so they cannot describe different workouts. The
+chosen shape is stored in `planned_workout.structure` when the day is written and
+read by every push path via `structured_workout_for_planned_row`.
+
+| structure | Phase | Steps pushed |
+|---|---|---|
+| `strides` | base | Planned distance **minus the timed tail** at easy pace → 6 × (20s stride + 60s jog, by feel) → 5 min cool-down |
+| `tempo` | build | 10 min warm-up → 3 × (8 min near goal pace + 3 min jog) → 10 min cool-down |
+| `intervals` | peak | 10 min warm-up → 4 × (6 min at goal pace + 3 min jog) → 10 min cool-down |
+| `sharpener` | taper | 10 min warm-up → 2 × (5 min at goal pace + 3 min jog) → 10 min cool-down |
+| `NULL` | easy / long / recovery / rest, and any quality day whose phase can't be resolved | One distance step at the day's target pace (no steps at all for rest) |
+
+A base-phase quality day is not a hard session — the running is at easy pace and
+only the strides are fast — so it takes the easy pace, and readiness-based easing
+trims its volume rather than demoting it.
+
+Storing the shape rather than re-deriving the phase at push time is deliberate: a
+failed phase lookup would otherwise decide the session silently. Rows written
+before the column existed fall back through `row_structure`, which returns `NULL`
+(a plain steady run) and logs when the phase can't be resolved — degrading toward
+the easier session rather than inventing intervals.
 
 ### Underlying Garmin data available (not yet exposed)
 

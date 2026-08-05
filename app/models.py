@@ -25,3 +25,7 @@ class Readiness:
     weekly_distance_km: float
     four_week_avg_km: float
     acute_chronic_ratio: Optional[float]
+    # True when verified recovery metrics for today fed the score. False means the
+    # verdict reflects training load alone — either nothing had synced, or the
+    # caller did not ask for metrics (e.g. GET /readiness without live=true).
+    physiological: bool = False

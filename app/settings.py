@@ -22,6 +22,11 @@ class Settings:
     # Goal-driven plan: morning auto-update
     morning_update_time: str = os.getenv("MORNING_UPDATE_TIME", "06:00")  # HH:MM, local to TIMEZONE
     timezone: str = os.getenv("TIMEZONE", "Asia/Jerusalem")
+    # The morning job retries this often while waiting for the watch to sync its
+    # post-sleep recovery metrics, giving up at MORNING_RETRY_UNTIL and adapting
+    # on training load alone.
+    morning_retry_minutes: int = int(os.getenv("MORNING_RETRY_MINUTES", "20"))
+    morning_retry_until: str = os.getenv("MORNING_RETRY_UNTIL", "09:00")  # HH:MM, local to TIMEZONE
     goal_auto_push: bool = os.getenv("GOAL_AUTO_PUSH", "true").lower() == "true"
     goal_push_horizon_days: int = int(os.getenv("GOAL_PUSH_HORIZON_DAYS", "7"))
 

@@ -19,13 +19,20 @@ def format_summary(workout: dict[str, Any]) -> str:
     except Exception:
         dow = str(d)
 
-    kind = (workout.get("kind") or "run").title()
+    # Prefer the prescribed session title ("Easy run + strides") over the bare
+    # kind label, which hid prescribed work like strides from the message.
+    # Callers passing a raw planned_workout row must add `title` themselves —
+    # see `main.goal_today_notify`.
+    kind = workout.get("title") or (workout.get("kind") or "run").title()
     dist = float(workout.get("distance_km") or 0)
     pace = workout.get("target_pace_sec")
     pace_txt = f" @ {int(pace) // 60}:{int(pace) % 60:02d}/km" if pace else ""
     line = "Rest day" if (workout.get("kind") == "rest" or dist <= 0) else f"{kind} — {dist:g} km{pace_txt}"
 
     parts = [f"\U0001F3C3 Today · {dow}", line]
+    details = workout.get("details")
+    if details and dist > 0:
+        parts.append(str(details))
     note = workout.get("coach_note")
     if note:
         parts.append(f"Coach: {note}")
@@ -91,7 +98,7 @@ def morning_email_html(workout: dict[str, Any]) -> str:
         dow = date.fromisoformat(str(d)).strftime("%A &middot; %B %-d")
     except Exception:
         dow = str(d)
-    kind = (workout.get("kind") or "run").title()
+    kind = workout.get("title") or (workout.get("kind") or "run").title()
     dist = float(workout.get("distance_km") or 0)
     pace = workout.get("target_pace_sec")
     pace_txt = f"{int(pace) // 60}:{int(pace) % 60:02d}/km" if pace else ""
@@ -100,10 +107,13 @@ def morning_email_html(workout: dict[str, Any]) -> str:
     if workout.get("kind") == "rest" or dist <= 0:
         body += "<div class=\"stat\"><span class=\"accent\">Rest day</span> &mdash; recover, hydrate, light mobility.</div>"
     else:
-        stat = f"<span class=\"accent\">{kind}</span> &middot; {dist:g} km"
+        stat = f"<span class=\"accent\">{_escape(str(kind))}</span> &middot; {dist:g} km"
         if pace_txt:
             stat += f" @ {pace_txt}"
         body += f"<div class=\"stat\">{stat}</div>"
+        details = workout.get("details")
+        if details:
+            body += f"<div class=\"subtitle\">{_escape(str(details))}</div>"
     note = workout.get("coach_note")
     if note:
         body += f"<div class=\"note\"><p>{_escape(note)}</p></div>"
@@ -182,7 +192,7 @@ def _summary_subject(workout: dict[str, Any]) -> str:
         dow = date.fromisoformat(str(d)).strftime("%a %d %b")
     except Exception:
         dow = str(d)
-    kind = (workout.get("kind") or "run").title()
+    kind = workout.get("title") or (workout.get("kind") or "run").title()
     return f"PACER · {dow} · {kind}"
 
 

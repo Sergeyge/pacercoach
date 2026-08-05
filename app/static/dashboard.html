@@ -139,6 +139,11 @@
   .ph-line .ph-vol{margin-left:auto;font-family:"JetBrains Mono";font-size:13px;color:var(--volt);white-space:nowrap}
   .ph-sub{font-family:"JetBrains Mono";font-size:12px;color:var(--muted);margin-top:4px}
   .ph-focus{font-size:13px;color:var(--muted);line-height:1.5;margin-top:4px}
+  /* condition line under today's session */
+  .condition{font-size:12.5px;line-height:1.6;color:var(--muted);margin-top:10px}
+  .condition:empty{display:none}
+  .condition .why{display:block}
+  .condition .stale{color:#ffb428}
   /* readiness */
   .score{font-family:"Anton";font-size:64px;line-height:1}
   .reasons{color:var(--muted);font-size:13px;line-height:1.6;margin-top:8px}
@@ -246,7 +251,7 @@
     .today-main{gap:12px}
     .score{font-size:52px}
     .actions{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-    .actions button:first-child{grid-column:1/-1}
+    .actions button:first-child,.actions button:last-child{grid-column:1/-1}
     .msg{max-width:94%}
     #chatThread{max-height:50vh}
     .wk .d{width:44px}
@@ -319,8 +324,10 @@
         <span id="todayReadiness" class="pill"></span>
         <span id="todaySource" class="tag"></span>
       </div>
+      <div id="todayCondition" class="condition"></div>
       <div class="actions">
-        <button data-act="refresh">Re-adapt</button>
+        <button data-act="recheck">Check my condition</button>
+        <button data-act="refresh" class="ghost">Re-adapt</button>
         <button data-act="push" class="ghost">Push to watch</button>
         <button data-act="notify" class="ghost">Send summary</button>
       </div>
@@ -464,7 +471,9 @@ function renderToday(t){
     $("#todayNote").textContent = "Plan paused — morning adapt + auto-push are skipped. The plan calendar shifts forward when you resume.";
     $("#todaySource").textContent = "paused";
   } else {
-    $("#todayKind").textContent = rest?"Rest":(t.kind||"run");
+    // Prefer the prescribed session title ("Easy run + strides") — the bare kind
+    // says "quality", which contradicts both the email and the watch.
+    $("#todayKind").textContent = rest?"Rest":(t.title||t.kind||"run");
     $("#todayDist").textContent = rest?"":`${t.distance_km} km`;
     $("#todayPace").textContent = rest?"":pace(t.target_pace_sec);
     $("#todayNote").textContent = t.coach_note || t.details || "";
@@ -475,6 +484,33 @@ function renderToday(t){
   const pill=$("#todayReadiness");
   if(rd && !paused){ pill.style.display=""; pill.className="pill "+rd.status; pill.textContent=`Readiness ${rd.status}${rd.score!=null?" · "+rd.score:""}`; }
   else pill.style.display="none";
+  renderCondition(t, paused);
+}
+// What the readiness verdict was actually based on. Without this a score built
+// from training load alone is indistinguishable from one built on last night's
+// sleep and HRV.
+function renderCondition(t, paused){
+  const el=$("#todayCondition"); if(!el) return;
+  const rd = t && t.readiness;
+  if(paused || !rd || !rd.status){ el.innerHTML=""; return; }
+  const f = t.metrics_freshness || {};
+  // If the verdict did use today's metrics, say so first — a partial sync leaves
+  // `stale`/`unverified` populated, and testing those first told the athlete the
+  // day was load-only when it wasn't. Whatever was ignored is a footnote.
+  const ignored = []
+    .concat(f.stale && f.stale.length ? ["not from today: " + f.stale.join(", ")] : [])
+    .concat(f.unverified && f.unverified.length ? ["unconfirmed: " + f.unverified.join(", ")] : []);
+  let head;
+  if(rd.physiological){
+    head = "From this morning's recovery metrics";
+    if(ignored.length) head += ` <span class="stale">(ignored ${_escapeHtml(ignored.join("; "))})</span>`;
+  }
+  else if(f.errors) head = '<span class="stale">Garmin refused the recovery requests — training load only</span>';
+  else if(f.reason) head = `<span class="stale">Recovery data unusable (${_escapeHtml(String(f.reason))}) — training load only</span>`;
+  else if(ignored.length) head = `<span class="stale">Recovery data ${_escapeHtml(ignored.join("; "))} — training load only</span>`;
+  else head = '<span class="stale">No recovery data synced yet — training load only</span>';
+  const why = (rd.reasons||[]).join(" · ");
+  el.innerHTML = head + (why?`<span class="why">${_escapeHtml(why)}</span>`:"");
 }
 function renderWeek(w){
   if(!w||!w.workouts){ $("#week").textContent="—"; return; }
@@ -486,7 +522,7 @@ function renderWeek(w){
     else if (x.firmness&&x.firmness.startsWith("today")) fb='<span class="badge">today</span>';
     else if (x.status==="done"||x.status==="completed") fb='<span class="badge done">done</span>';
     else fb='<span class="badge proj">'+ (x.firmness==="adjusted"?"adj":"proj") +'</span>';
-    const kindLabel = paused ? 'Paused' : (rest ? 'Rest' : x.kind);
+    const kindLabel = paused ? 'Paused' : (rest ? 'Rest' : (x.title||x.kind));
     const v = paused ? '<span class="v muted">—</span>' : (rest?'<span class="v muted">—</span>':`<span class="v">${x.distance_km}km · ${pace(x.target_pace_sec)}</span>`);
     return `<div class="wk"><span class="d">${dow(x.date)}</span><span class="k ${rest||paused?'rest':''}">${kindLabel}${fb}</span>${v}</div>`;
   }).join("");
@@ -533,7 +569,8 @@ function renderReadiness(r){
   const c=r.status;
   $("#readiness").innerHTML =
     `<div style="display:flex;align-items:baseline;gap:12px;flex-wrap:wrap"><span class="score" style="color:var(--${c==='green'?'green':c==='yellow'?'amber':'red'})">${r.score}</span><span class="pill ${c}">${c}</span></div>`+
-    `<div class="reasons">${(r.reasons||[]).join(" · ")}</div>`+
+    `<div class="reasons">${_escapeHtml((r.reasons||[]).join(" · "))}</div>`+
+    `<div class="condition">${r.physiological?"Includes this morning's recovery metrics":'<span class="stale">Training load only — tap “Check my condition” to include recovery metrics</span>'}</div>`+
     `<div style="margin-top:12px"><div class="kv">7-day load <b>${r.weekly_distance_km} km</b></div><div class="kv">4-week avg <b>${r.four_week_avg_km} km</b></div><div class="kv">acute:chronic <b>${r.acute_chronic_ratio??"—"}</b></div></div>`;
 }
 function renderRuns(d){
@@ -811,7 +848,26 @@ async function loadAll(){
 async function act(name,btn){
   const orig=btn.textContent; btn.disabled=true; btn.textContent="…";
   try{
-    if(name==="refresh"){ const w=await api("/goal/today/refresh?live=true",{method:"POST"}); renderToday(w); toast("Today re-adapted ("+(w.engine||"")+")"); }
+    if(name==="recheck"){
+      const w=await api("/goal/today/recheck",{method:"POST"});
+      renderToday(w);
+      // Render the Readiness card from this response — re-fetching /readiness
+      // would show the load-only score and contradict the card above.
+      if(w.readiness) renderReadiness(w.readiness);
+      // Report a failure to reach the watch first: it is the more actionable
+      // problem, and checking freshness first made these branches unreachable.
+      const g=w.garmin||{}, f=w.metrics_freshness||{};
+      const fresh=f.fresh && (w.readiness||{}).physiological;
+      const condition = fresh ? "Condition checked" : "No recovery data yet";
+      if(g.status==="error") toast(condition+" · could not reach your watch: "+(g.error||"unknown error"));
+      else if(g.status==="skipped") toast(g.reason||"Nothing to change today");
+      else if(!fresh) toast("No recovery data synced yet — today is set from training load");
+      else if(g.status==="ok") toast("Condition checked · session updated on your watch ✓");
+      else if(g.status==="already_pushed") toast("Condition checked · today is already right ✓");
+      else if(g.status==="skipped_rest_day") toast("Condition checked · rest day, nothing to push");
+      else toast("Condition checked ("+(g.status||"done")+")");
+    }
+    else if(name==="refresh"){ const w=await api("/goal/today/refresh?live=true",{method:"POST"}); renderToday(w); toast("Today re-adapted ("+(w.engine||"")+")"); }
     else if(name==="push"){ const r=await api("/goal/today/push",{method:"POST"}); toast(r.status==="ok"?"Pushed to Garmin ✓":(r.status||"done")); }
     else if(name==="notify"){
       const r=await api("/goal/today/notify",{method:"POST"});

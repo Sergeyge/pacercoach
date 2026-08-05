@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
+import sys
 from datetime import date, timedelta
 from typing import Any
 
@@ -19,7 +20,11 @@ _DETAILS = {
     "easy": "Easy aerobic run, fully conversational.",
     "long": "Long run, steady and relaxed — do not push the pace.",
     "recovery": "Very easy recovery run; stop early if legs feel heavy.",
-    "quality": "Warm up 10 min, then tempo work (e.g. 3 x 8 min) near goal pace, cool down 10 min.",
+    # Fallback for a quality day whose phase can't be resolved (a plan predating
+    # phase support). Such a day is pushed as one continuous run at its target
+    # pace, so this must describe that and not promise intervals — the prose used
+    # to prescribe 3 x 8 min the publisher never built.
+    "quality": "Steady continuous run near goal pace — no training phase is set, so no interval structure is prescribed.",
     "rest": "Rest day — optional 20–30 min strength / mobility.",
 }
 
@@ -34,13 +39,120 @@ PHASE_FOCUS = {
     "taper": "Volume drops, a touch of intensity stays — arrive at race day fresh.",
 }
 
-# Quality-day prescription varies by phase (base stays light, taper stays short).
-_PHASE_QUALITY = {
-    "base": "Warm up 10 min, then 6-8 x 20s relaxed strides with full recovery; keep the rest easy.",
-    "build": "Warm up 10 min, then tempo work (e.g. 3 x 8 min) near goal pace, cool down 10 min.",
-    "peak": "Warm up 10 min, then race-pace intervals (e.g. 4-5 x 6 min at goal pace), cool down 10 min.",
-    "taper": "Warm up 10 min, then 2 x 5 min at goal pace — short and controlled, just staying sharp.",
+# What a "quality" day actually is, per phase. One entry defines the whole
+# session: the prose, the day's target pace and the steps pushed to the watch are
+# all derived from it, so a RULE-GENERATED day cannot describe a different workout
+# than it pushes. (A coach-adapted day stores the model's own prose while the steps
+# still come from `structure`, so those two can still drift — see `_merge_clamp`
+# and the `details` rule in `openai_client._SYSTEM_PROMPT`.) Before this table the
+# base-phase prose said strides while the pace said near-goal tempo and the watch
+# got 3 x 8 min, and the peak/taper prose promised intervals never built.
+#
+#   structure      value stored in planned_workout.structure and dispatched on
+#                  when building the watch workout
+#   easy_body      True  -> the planned distance MINUS the timed tail (reps +
+#                          cool-down, converted at the easy pace) is run at easy
+#                          pace and the reps are appended — a strides day, which
+#                          is not a hard session
+#                  False -> time-based warm-up, then the reps, then a cool-down;
+#                          the planned distance is metadata only
+#   reps_at_pace   whether the work intervals carry the day's pace target;
+#                  strides are run fast by feel, so they do not. Currently always
+#                  `not easy_body`; kept separate so a future shape can combine an
+#                  easy body with paced reps.
+QUALITY_SHAPES: dict[str, dict[str, Any]] = {
+    "base": {
+        "structure": "strides",
+        "title": "Easy run + strides",
+        "easy_body": True,
+        "reps_at_pace": False,
+        "reps": 6,
+        "work_seconds": 20,
+        "recovery_seconds": 60,
+        "warmup_seconds": 0,
+        "cooldown_seconds": 300,
+        "prose": (
+            "Easy aerobic run, then {reps} x {work_seconds}s relaxed strides "
+            "({recovery_seconds}s jog between each) and an easy cool-down. "
+            "The running stays at easy pace — the strides are fast but short and by feel, "
+            "so this is not a hard session."
+        ),
+    },
+    "build": {
+        "structure": "tempo",
+        "title": "Tempo run",
+        "easy_body": False,
+        "reps_at_pace": True,
+        "reps": 3,
+        "work_seconds": 480,
+        "recovery_seconds": 180,
+        "warmup_seconds": 600,
+        "cooldown_seconds": 600,
+        "prose": (
+            "Warm up {warmup_minutes} min, then {reps} x {work_minutes} min of tempo work near "
+            "goal pace with {recovery_minutes} min jog recoveries, cool down {cooldown_minutes} min."
+        ),
+    },
+    "peak": {
+        "structure": "intervals",
+        "title": "Race-pace intervals",
+        "easy_body": False,
+        "reps_at_pace": True,
+        "reps": 4,
+        "work_seconds": 360,
+        "recovery_seconds": 180,
+        "warmup_seconds": 600,
+        "cooldown_seconds": 600,
+        "prose": (
+            "Warm up {warmup_minutes} min, then {reps} x {work_minutes} min at goal pace with "
+            "{recovery_minutes} min jog recoveries, cool down {cooldown_minutes} min."
+        ),
+    },
+    "taper": {
+        "structure": "sharpener",
+        "title": "Race-pace sharpener",
+        "easy_body": False,
+        "reps_at_pace": True,
+        "reps": 2,
+        "work_seconds": 300,
+        "recovery_seconds": 180,
+        "warmup_seconds": 600,
+        "cooldown_seconds": 600,
+        "prose": (
+            "Warm up {warmup_minutes} min, then {reps} x {work_minutes} min at goal pace "
+            "({recovery_minutes} min jog between) — short and controlled, just staying sharp. "
+            "Cool down {cooldown_minutes} min."
+        ),
+    },
 }
+
+SHAPES_BY_STRUCTURE: dict[str, dict[str, Any]] = {s["structure"]: s for s in QUALITY_SHAPES.values()}
+
+
+def _shape_prose(shape: dict[str, Any]) -> str:
+    """Render a shape's prose from its own numbers, so wording and steps agree."""
+    return shape["prose"].format(  # noqa: E501 - placeholders are validated at import (below)
+        reps=shape["reps"],
+        work_seconds=shape["work_seconds"],
+        recovery_seconds=shape["recovery_seconds"],
+        work_minutes=round(shape["work_seconds"] / 60),
+        recovery_minutes=round(shape["recovery_seconds"] / 60),
+        warmup_minutes=round(shape["warmup_seconds"] / 60),
+        cooldown_minutes=round(shape["cooldown_seconds"] / 60),
+    )
+
+
+# Fail at import rather than at 06:00: an unknown placeholder in a `prose`
+# template, or two shapes sharing a `structure` name (which would make one of them
+# unreachable and push the other's session), are configuration mistakes worth
+# catching on deploy.
+for _phase, _shape in QUALITY_SHAPES.items():
+    _shape_prose(_shape)
+assert len(SHAPES_BY_STRUCTURE) == len(QUALITY_SHAPES), "QUALITY_SHAPES structure names must be unique"
+
+# Watch/notification titles per session kind. Quality days take their title from
+# their shape instead (see `title_for`).
+_TITLES = {"easy": "Easy run", "long": "Long run", "recovery": "Recovery run", "quality": "Quality run", "rest": "Rest day"}
 
 
 def default_total_weeks(distance_km: float) -> int:
@@ -170,13 +282,111 @@ def pace_text(pace_sec: int | None) -> str:
     return f"{pace_sec // 60}:{pace_sec % 60:02d} min/km"
 
 
-def details_for(kind: str, pace_sec: int | None, phase: str | None = None) -> str:
-    if kind == "quality" and phase in _PHASE_QUALITY:
-        base = _PHASE_QUALITY[phase]
-    else:
-        base = _DETAILS.get(kind, "")
+def shape_for(kind: str, *, phase: str | None = None) -> dict[str, Any] | None:
+    """The quality shape for a day, or None when the day isn't a shaped session.
+
+    Returns None for a non-quality kind AND for a quality day whose phase can't
+    be resolved. Guessing a shape for an unknown phase would mean prescribing
+    intervals nobody asked for, so an unknown phase degrades to a plain steady
+    run at the day's own pace rather than to the harder session.
+    """
+    if kind != "quality" or phase is None:
+        return None
+    return QUALITY_SHAPES.get(phase)
+
+
+def details_for(kind: str, pace_sec: int | None, *, phase: str | None = None) -> str:
+    """The athlete-facing prescription for a day.
+
+    `phase` is keyword-only for the same reason as its siblings: `phase` and
+    `structure` are both `str | None`, and passing a structure name here silently
+    returned the generic fallback prose instead of raising.
+    """
+    shape = shape_for(kind, phase=phase)
+    base = _shape_prose(shape) if shape else _DETAILS.get(kind, "")
     p = pace_text(pace_sec)
     return f"{base} Target {p}.".strip() if p else base
+
+
+def is_strides_session(kind: str, *, phase: str | None = None) -> bool:
+    """True for a base-phase quality day — an easy-pace run plus strides rather
+    than a hard session. Used for the day's target pace, the readiness-easing
+    decision, and the `is_hard_session` flag handed to the coach. The title and
+    the pushed workout come from the shape itself (`structure_for`/`title_for`).
+    """
+    shape = shape_for(kind, phase=phase)
+    return bool(shape and shape["easy_body"])
+
+
+def pace_for(kind: str, paces: dict[str, Any], *, phase: str | None = None) -> int | None:
+    """The day's target pace. A strides day runs at EASY pace — the strides
+    themselves are by feel — so it must not inherit the near-goal-pace quality
+    target, which would describe the session as a tempo run."""
+    if is_strides_session(kind, phase=phase):
+        return paces.get("easy")
+    return paces.get(kind)
+
+
+def structure_for(kind: str, *, phase: str | None = None) -> str | None:
+    """Session shape name for the watch ('strides'/'tempo'/'intervals'/
+    'sharpener'), or None for a plain steady run.
+
+    Stored on the planned day (planned_workout.structure) so a push normally
+    builds the session from data instead of re-deriving the phase. Rows written
+    before the column existed still fall back through `row_structure`.
+    """
+    shape = shape_for(kind, phase=phase)
+    return str(shape["structure"]) if shape else None
+
+
+def title_for(kind: str, *, structure: str | None = None) -> str:
+    """Session title as it appears on the watch and in the morning message.
+
+    `structure` is keyword-only on purpose: it and `phase` are both `str | None`
+    on sibling functions here, so a positional call passing a phase by mistake
+    would return the wrong title with no error. That title then feeds the
+    publisher's sniffing fallback, which is how a strides day becomes a tempo one.
+    """
+    shape = SHAPES_BY_STRUCTURE.get(structure or "")
+    return str(shape["title"]) if shape else _TITLES.get(kind, "Run")
+
+
+def phase_name_for(day: date) -> str | None:
+    """Phase name ('base'/'build'/'peak'/'taper') for `day` on the active plan.
+    None when there is no plan, or the plan predates phase support."""
+    ctx = active_phase_context(day)
+    return ctx.get("phase") if ctx else None
+
+
+def row_structure(row: Any, plan_date: date) -> str | None:
+    """A planned day's session shape: the stored value when present, otherwise
+    derived from the plan phase for rows written before it was persisted.
+
+    Only quality days can have a shape, so non-quality kinds return immediately
+    rather than paying for a plan lookup on every easy/long/recovery/rest day.
+    """
+    kind = row["kind"]
+    if kind != "quality":
+        return None
+    try:
+        stored = row["structure"]
+    except (KeyError, IndexError):
+        stored = None
+    if stored:
+        return str(stored)
+    phase = phase_name_for(plan_date)
+    if phase is None:
+        # Legacy row and no resolvable phase: fall back to a plain steady run
+        # rather than inventing intervals, and say so — silently choosing a
+        # shape here is what produced tempo sessions on strides days.
+        print(
+            f"[goal_planner.row_structure] {plan_date}: quality day has no stored structure and "
+            "the plan phase could not be resolved; pushing it as a plain run",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
+    return structure_for(kind, phase=phase)
 
 
 def derive_paces(goal_pace_sec: int) -> dict[str, int | None]:
@@ -307,10 +517,45 @@ def build_and_store_plan(
     }
 
 
+def _is_stale_projection(
+    existing: sqlite3.Row,
+    kind: str,
+    distance_km: float,
+    pace: int | None,
+    details: str,
+    structure: str | None,
+) -> bool:
+    """True when an existing row is still an untouched rule projection whose
+    prescription no longer matches what the plan would generate today.
+
+    Projections are refreshed rather than frozen, so a change to the phase rules
+    (e.g. base-phase quality days moving from near-goal pace to easy pace +
+    strides) or to the plan's volume reaches days that were materialized under
+    the old rules. Adapted, completed and already-pushed days are never
+    rewritten — the athlete has either received them on the watch or the coach
+    has deliberately set them.
+    """
+    if existing["source"] != "rule" or existing["status"] != "planned":
+        return False
+    if existing["garmin_workout_id"]:
+        return False
+    return (
+        existing["kind"] != kind
+        # Distance is stored as a rounded float, so compare with a tolerance
+        # well under the 0.1 km the planner rounds to.
+        or abs(float(existing["distance_km"] or 0) - distance_km) > 0.01
+        or existing["target_pace_sec"] != pace
+        or (existing["details"] or "") != details
+        or (existing["structure"] or None) != structure
+    )
+
+
 def materialize(plan_row: sqlite3.Row | dict[str, Any], start: date, days: int = 14) -> None:
     """Create rule-based planned_workout rows for `days` from `start`.
 
-    Existing rows (adapted or completed) are left untouched.
+    Adapted, completed and already-pushed days are left untouched. Untouched
+    rule projections are refreshed when the plan's rules would now prescribe
+    something different (see `_is_stale_projection`).
     """
     template = {int(k): v for k, v in json.loads(plan_row["weekly_template"]).items()}
     prog = json.loads(plan_row["progression"])
@@ -321,18 +566,23 @@ def materialize(plan_row: sqlite3.Row | dict[str, Any], start: date, days: int =
     for offset in range(days):
         day = start + timedelta(days=offset)
         ds = day.isoformat()
-        if get_planned_workout(ds) is not None:
-            continue  # keep adapted/completed/existing days
+        existing = get_planned_workout(ds)
         kind = template.get(day.weekday(), "rest")
         if kind == "rest":
-            upsert_planned_workout(ds, "rest", 0.0, None, details_for("rest", None), source="rule")
+            details = details_for("rest", None)
+            if existing is None or _is_stale_projection(existing, "rest", 0.0, None, details, None):
+                upsert_planned_workout(ds, "rest", 0.0, None, details, source="rule")
             continue
         week_index = max(0, (day - plan_start).days // 7)
         wk = weekly_volume(base, week_index, prog)
         distance = round(wk * KIND_RATIO[kind], 1)
-        pace = paces.get(kind)
         ph = phase_for_week(prog.get("phases") or [], week_index)
-        upsert_planned_workout(ds, kind, distance, pace, details_for(kind, pace, ph["name"] if ph else None), source="rule")
+        phase = ph["name"] if ph else None
+        pace = pace_for(kind, paces, phase=phase)
+        details = details_for(kind, pace, phase=phase)
+        structure = structure_for(kind, phase=phase)
+        if existing is None or _is_stale_projection(existing, kind, distance, pace, details, structure):
+            upsert_planned_workout(ds, kind, distance, pace, details, source="rule", structure=structure)
 
 
 def plan_phase_overview(today: date | None = None) -> dict[str, Any]:
