@@ -181,8 +181,25 @@ def _fetch_hr_zones_live() -> dict[str, Any]:
     try:
         lt = client.get_lactate_threshold(latest=True) or {}
         shr = (lt.get("speed_and_heart_rate") or {}) if isinstance(lt, dict) else {}
-        speed_ms = shr.get("speed")
-        lt_pace = round(1000.0 / float(speed_ms)) if isinstance(speed_ms, (int, float)) and speed_ms > 0 else None
+        # Garmin's `speed` here is SECONDS PER METRE despite the name, so the
+        # pace is speed * 1000 — not 1000 / speed. Verified against this
+        # account: 0.31666578 -> 5:17/km, which sits correctly between Garmin's
+        # own 5K (5:04/km) and 10K (5:25/km) predictions, with the reported
+        # threshold HR just under the zone-5 floor. Inverting it shipped a
+        # confident "52:38/km".
+        raw_speed = shr.get("speed")
+        lt_pace = round(float(raw_speed) * 1000) if isinstance(raw_speed, (int, float)) and raw_speed > 0 else None
+        # A threshold pace outside running range means Garmin changed the unit.
+        # Drop it rather than pass it on: the coach quotes this number, and a
+        # wrong one is worse than a missing one.
+        if lt_pace is not None and not (_PACE_MIN_SEC <= lt_pace <= _PACE_MAX_SEC):
+            print(
+                f"[zones] discarding implausible lactate-threshold pace {lt_pace} sec/km "
+                f"from speed={raw_speed!r} — Garmin's unit for this field may have changed",
+                file=sys.stderr,
+                flush=True,
+            )
+            lt_pace = None
         lt_hr = int(shr["heartRate"]) if isinstance(shr.get("heartRate"), (int, float)) else None
         if lt_pace or lt_hr:
             result["lactate_threshold"] = {
