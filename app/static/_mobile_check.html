@@ -1,0 +1,19 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+body{background:#222;display:flex;gap:20px;padding:16px;margin:0}
+iframe{border:2px solid #555;height:800px}
+</style></head><body>
+<iframe id="f390" src="dashboard.html" width="390"></iframe>
+<iframe id="f320" src="dashboard.html" width="320"></iframe>
+<script>
+function stage(f){
+  const d=f.contentDocument, w=f.contentWindow;
+  d.getElementById('gate').style.display='none';
+  d.getElementById('app').hidden=false;
+  d.getElementById('connPanel').classList.add('open');
+  w.renderSync({auto_sync_enabled:true,sync_interval_minutes:240,
+    next_sync_at:new Date(Date.now()+161*60000).toISOString(),
+    recent_syncs:[{synced_at:new Date(Date.now()-79*60000).toISOString(),status:'ok',message:'synced 2 activities'}]});
+}
+window.addEventListener('load',()=>{ stage(document.getElementById('f390')); stage(document.getElementById('f320')); });
+</script>
+</body></html>

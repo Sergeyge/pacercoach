@@ -60,7 +60,12 @@
   .conn select{background:#0c0e0b;border:1px solid var(--line);color:var(--ink);border-radius:10px;padding:8px 10px;font-family:"JetBrains Mono";font-size:12px;max-width:180px}
   .conn select:focus{outline:none;border-color:var(--volt)}
   .conn-sync{display:flex;align-items:center;gap:10px;border-left:1px solid var(--line);padding-left:12px}
-  .conn-sync .sync-status{font-family:"JetBrains Mono";font-size:12px}
+  .conn-sync .sync-status{font-family:"JetBrains Mono";font-size:12px;line-height:1.7}
+  .sync-status b{font-weight:500}
+  .sync-status .st-ok{color:var(--green)}
+  .sync-status .st-warn{color:var(--amber)}
+  .sync-status .st-error{color:var(--red)}
+  .sync-status .st-info{color:var(--ink)}
   .dot{width:9px;height:9px;border-radius:50%;background:#444;box-shadow:0 0 0 0 rgba(200,251,80,.6)}
   .dot.on{background:var(--volt);animation:pulse 2.4s infinite}
   @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(200,251,80,.5)}70%{box-shadow:0 0 0 9px rgba(200,251,80,0)}100%{box-shadow:0 0 0 0 rgba(200,251,80,0)}}
@@ -111,6 +116,7 @@
   .badge{font-size:10px;letter-spacing:.5px;text-transform:uppercase;color:#10130b;background:var(--volt);border-radius:6px;padding:2px 6px;margin-left:8px}
   .badge.proj{background:transparent;color:var(--muted);border:1px solid var(--line)}
   .badge.done{background:rgba(116,224,138,.18);color:var(--green)}
+  .badge.yours{background:rgba(200,251,80,.16);color:var(--volt);border:1px solid var(--line)}
   /* training roadmap */
   .roadmap-pos{font-size:14px;color:var(--muted);margin-bottom:14px;line-height:1.6}
   .roadmap-pos b{color:var(--ink);font-family:"JetBrains Mono"}
@@ -163,7 +169,8 @@
   .change-head{display:flex;align-items:center;gap:8px;font-size:11px;letter-spacing:2px;text-transform:uppercase;color:var(--volt);font-weight:600;margin-bottom:8px}
   .change-head .dot{width:7px;height:7px;border-radius:50%;background:var(--volt)}
   .change-summary{font-size:14px;line-height:1.5;color:var(--ink);margin-bottom:12px}
-  .change-actions{display:flex;gap:8px;align-items:center}
+  .change-lock{flex-basis:100%;font-size:12px;line-height:1.5;color:var(--muted);margin-top:6px}
+  .change-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
   .change-actions button{padding:7px 14px;font-size:12px}
   .pause-banner{display:flex;align-items:center;gap:10px;padding:10px 14px;background:rgba(255,180,40,.10);border:1px solid rgba(255,180,40,.35);border-radius:10px;font-size:13px;margin-bottom:12px}
   .pause-banner .dot{width:8px;height:8px;border-radius:50%;background:#ffb428;flex:0 0 auto}
@@ -348,6 +355,7 @@
     <div class="card"><h2>Shoe Mileage</h2><div id="gear" class="muted">Km per pair (warns near 600–800 km).</div><div style="margin-top:14px"><button data-act="gear" class="ghost">Load gear</button></div></div>
     <div class="card review" style="grid-column:1/-1"><h2>Last Run · AI Coach Review</h2>
       <div id="analysis" class="muted">Once you finish and sync a run, the coach's review will appear here (and arrive via your notification channel).</div>
+      <div style="margin-top:14px"><button data-act="rereview" class="ghost">Re-review this run</button></div>
     </div>
     <div class="card" style="grid-column:1/-1">
       <div style="display:flex;align-items:baseline;justify-content:space-between;gap:12px">
@@ -478,7 +486,10 @@ function renderToday(t){
     $("#todayPace").textContent = rest?"":pace(t.target_pace_sec);
     $("#todayNote").textContent = t.coach_note || t.details || "";
     const src = t.source || t.engine || "";
-    $("#todaySource").textContent = src? (src==="adapted"||src==="openai+rules"?"AI-adapted":"rule-based"):"";
+    const srcLabel = {athlete:"Set by you", "athlete-set":"Set by you", adapted:"AI-adapted", "openai+rules":"AI-adapted"}[src] || (src?"rule-based":"");
+    $("#todaySource").textContent = srcLabel;
+    $("#todaySource").title = (src==="athlete"||src==="athlete-set")
+      ? "You set this session in coach chat — the morning adaptation keeps it as asked" : "";
   }
   const rd = (t.readiness && t.readiness.status) ? t.readiness : null;
   const pill=$("#todayReadiness");
@@ -495,10 +506,11 @@ function renderCondition(t, paused){
   if(paused || !rd || !rd.status){ el.innerHTML=""; return; }
   const f = t.metrics_freshness || {};
   // If the verdict did use today's metrics, say so first — a partial sync leaves
-  // `stale`/`unverified` populated, and testing those first told the athlete the
-  // day was load-only when it wasn't. Whatever was ignored is a footnote.
+  // `stale`/`pre_wake`/`unverified` populated, and testing those first told the
+  // athlete the day was load-only when it wasn't. Whatever was ignored is a footnote.
   const ignored = []
     .concat(f.stale && f.stale.length ? ["not from today: " + f.stale.join(", ")] : [])
+    .concat(f.pre_wake && f.pre_wake.length ? ["written before you woke: " + f.pre_wake.join(", ")] : [])
     .concat(f.unverified && f.unverified.length ? ["unconfirmed: " + f.unverified.join(", ")] : []);
   let head;
   if(rd.physiological){
@@ -519,8 +531,9 @@ function renderWeek(w){
     const rest = x.kind==="rest"||!x.distance_km;
     let fb;
     if (paused) fb='<span class="badge" style="background:rgba(255,180,40,.18);color:#ffb428;border:1px solid rgba(255,180,40,.35)">paused</span>';
-    else if (x.firmness&&x.firmness.startsWith("today")) fb='<span class="badge">today</span>';
     else if (x.status==="done"||x.status==="completed") fb='<span class="badge done">done</span>';
+    else if (x.firmness==="set by you") fb='<span class="badge yours" title="You set this in coach chat — the morning adaptation leaves it as asked">yours</span>';
+    else if (x.firmness&&x.firmness.startsWith("today")) fb='<span class="badge">today</span>';
     else fb='<span class="badge proj">'+ (x.firmness==="adjusted"?"adj":"proj") +'</span>';
     const kindLabel = paused ? 'Paused' : (rest ? 'Rest' : (x.title||x.kind));
     const v = paused ? '<span class="v muted">—</span>' : (rest?'<span class="v muted">—</span>':`<span class="v">${x.distance_km}km · ${pace(x.target_pace_sec)}</span>`);
@@ -579,14 +592,60 @@ function renderRuns(d){
   $("#runs").innerHTML = `<table><tr><th>Date</th><th>Dist</th><th>Pace</th><th>HR</th></tr>`+
     a.slice(0,8).map(r=>`<tr><td class="mono">${r.activity_date}</td><td class="mono">${r.distance_km}km</td><td class="mono">${pace(r.avg_pace_sec_per_km)}</td><td class="mono">${r.avg_hr||"—"}</td></tr>`).join("")+`</table>`;
 }
+// Compact duration: "3h 12m" / "47m" / "<1m". Used by the sync row's countdown.
+function dur(ms){
+  const m=Math.round(Math.max(0,ms)/60000);
+  if(m<1) return "<1m";
+  if(m<60) return `${m}m`;
+  const h=Math.floor(m/60), r=m%60;
+  return r?`${h}h ${r}m`:`${h}h`;
+}
+function syncClock(iso){
+  const d=new Date(iso);
+  if(isNaN(d)) return iso;
+  const t=d.toLocaleTimeString(undefined,{hour:"2-digit",minute:"2-digit"});
+  const today=new Date();
+  const sameDay=d.toDateString()===today.toDateString();
+  return sameDay?t:`${d.toLocaleDateString(undefined,{month:"short",day:"numeric"})} ${t}`;
+}
+// Last /sync/status payload, repainted locally every 30s so the countdown to the
+// next sync stays honest on a page left open — and re-fetched once it runs out.
+let _syncData=null, _syncTick=null;
 function renderSync(s){
   const el=$("#sync");
   if(!s){ el.textContent="—"; return; }
+  _syncData=s;
+  paintSync();
+  if(!_syncTick) _syncTick=setInterval(paintSync,30000);
+}
+function paintSync(){
+  const s=_syncData; if(!s) return;
+  const el=$("#sync");
   const last=(s.recent_syncs&&s.recent_syncs[0])||null;
-  const bits=[`auto-sync ${s.auto_sync_enabled?"on":"off"}`,`every ${s.sync_interval_minutes}m`];
-  bits.push(last?`last ${last.status}`:"no syncs yet");
-  el.textContent=bits.join(" · ");
-  el.title=(last&&last.message)||"";
+  const bits=[s.auto_sync_enabled?`every ${s.sync_interval_minutes}m`:"auto-sync off"];
+  if(last){
+    bits.push(`last ${_escapeHtml(syncClock(last.synced_at))}`);
+    bits.push(`<b class="st-${_escapeHtml(last.status)}">${_escapeHtml(last.status)}</b>`);
+  }else{
+    bits.push("no syncs yet");
+  }
+  if(s.auto_sync_enabled){
+    const at=s.next_sync_at?new Date(s.next_sync_at):null;
+    const due=at&&!isNaN(at)?at-Date.now():null;
+    if(due==null) bits.push("next —");
+    else if(due<=0){ bits.push("next due now"); refreshSyncOnce(); }
+    else bits.push(`next in ${dur(due)}`);
+  }
+  el.innerHTML=bits.join(" · ");
+  el.title=[last&&`${last.synced_at} — ${last.message}`, s.next_sync_at&&`next sync ${syncClock(s.next_sync_at)}`].filter(Boolean).join("\n");
+}
+// One re-fetch per elapsed countdown, so the row picks up the sync that just ran
+// instead of sitting on "due now" until the next full page load.
+let _syncRefetching=false;
+function refreshSyncOnce(){
+  if(_syncRefetching) return;
+  _syncRefetching=true;
+  setTimeout(()=>api("/sync/status").then(renderSync).catch(()=>{}).finally(()=>{_syncRefetching=false;}),20000);
 }
 function renderProgress(p){
   const el=$("#progress");
@@ -647,7 +706,7 @@ function renderSplits(d){
   if(!d||d.error){ $("#splits").innerHTML=`<span class="muted">${(d&&d.error)||'unavailable'}</span>`; return; }
   const laps=d.laps||[];
   $("#splits").innerHTML = `<div class="tag" style="margin-bottom:8px">${d.date}</div><table><tr><th>Lap</th><th>Dist</th><th>Pace</th><th>HR</th></tr>`+
-    laps.map(l=>`<tr><td class="mono">${l.lap}</td><td class="mono">${l.distance_km}km</td><td class="mono">${pace(l.pace_sec)}</td><td class="mono">${l.avg_hr||'—'}</td></tr>`).join("")+`</table>`;
+    laps.map(l=>`<tr><td class="mono">${l.lap}</td><td class="mono">${Number(l.distance_km).toFixed(2)}km</td><td class="mono">${pace(l.pace_sec)}</td><td class="mono">${l.avg_hr||'—'}</td></tr>`).join("")+`</table>`;
 }
 function renderGear(d){
   if(!d||d.error){ $("#gear").innerHTML=`<span class="muted">${(d&&d.error)||'unavailable'}</span>`; return; }
@@ -766,7 +825,14 @@ function _appendChangeCard(change){
     try{
       const res=await api("/goal/coach/apply",{method:"POST",body:{change}});
       if(res.status==='applied'){
-        card.querySelector('.change-actions').innerHTML='<span style="color:var(--volt);font-size:13px;font-weight:600">✓ Applied</span>';
+        // Echo the numbers that actually landed. A request for a distance or a
+        // pace is only honoured if you can see what the plan stored — "Applied"
+        // alone can't tell you whether your 5:10 survived.
+        const landed=[res.kind==='rest'?'rest':res.kind, res.distance_km?`${res.distance_km} km`:'', pace(res.target_pace_sec)].filter(Boolean).join(' · ');
+        const lock = res.locked
+          ? '<div class="change-lock">Kept exactly as set — the morning adaptation won\'t change it. Ask to put the day back on plan to hand it back.</div>'
+          : (res.action==='follow_plan' ? '<div class="change-lock">Back on the plan — this day adapts automatically again.</div>' : '');
+        card.querySelector('.change-actions').innerHTML=`<span style="color:var(--volt);font-size:13px;font-weight:600">✓ Applied${landed?' · '+_escapeHtml(landed):''}</span>`+lock;
         toast('Plan updated ✓');
         _refreshGoalState();
       } else {
@@ -883,6 +949,11 @@ async function act(name,btn){
     else if(name==="metrics"){ const s=await api("/garmin/snapshot"); renderMetrics(s); }
     else if(name==="splits"){ const d=await api("/activities/last/splits"); renderSplits(d); }
     else if(name==="gear"){ const d=await api("/gear"); renderGear(d); }
+    else if(name==="rereview"){
+      const r=await api("/activities/re-review",{method:"POST"});
+      toast(r.status==="ok" ? "Review regenerated ✓" : ("Error: "+(r.error||r.status)));
+      if(r.status==="ok") await loadAnalysis();
+    }
     else if(name==="pause"){ await pausePlan(); }
     else if(name==="resume"){ await resumePlan(); }
   }catch(e){ toast("Error: "+e.message); }

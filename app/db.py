@@ -128,6 +128,32 @@ def init_db() -> None:
             )
             """
         )
+        # Per-lap splits of a completed run. `run_analyzer._LapReader` already
+        # fetches these from Garmin for every new activity to judge interval
+        # sessions, so persisting them here costs no extra Garmin calls — it just
+        # stops the data being discarded after the review prose is written.
+        #
+        # Laps are the only granularity at which a per-zone speed question can be
+        # answered honestly: a whole run's average HR puts every easy run in one
+        # zone, so bucketing by it leaves the hard zones permanently empty even
+        # for an athlete who trains in them.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS activity_lap (
+                source_id TEXT NOT NULL,
+                lap INTEGER NOT NULL,
+                distance_km REAL,
+                duration_sec INTEGER,
+                pace_sec INTEGER,
+                avg_hr INTEGER,
+                intensity_type TEXT,
+                PRIMARY KEY (source_id, lap)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_activity_lap_hr ON activity_lap (avg_hr)"
+        )
         # Migrations for columns added after initial release. Each ALTER is
         # wrapped in its own try because SQLite has no "ADD COLUMN IF NOT EXISTS".
         for stmt in (
@@ -187,6 +213,97 @@ def upsert_activities(activities: Iterable[RunActivity]) -> int:
         )
         conn.commit()
         return conn.total_changes - before
+
+
+def upsert_activity_laps(source_id: str, laps: Iterable[dict]) -> int:
+    """Store one activity's lap splits (as shaped by `garmin_extra.fetch_activity_splits`).
+
+    Replaces the activity's existing laps rather than merging, so a re-fetch of a
+    corrected activity cannot leave orphaned laps from the previous read behind.
+    """
+    rows = [lap for lap in laps if lap.get("lap") is not None]
+    if not rows:
+        return 0
+    with get_conn() as conn:
+        conn.execute("DELETE FROM activity_lap WHERE source_id = ?", (str(source_id),))
+        conn.executemany(
+            """
+            INSERT INTO activity_lap (
+                source_id, lap, distance_km, duration_sec, pace_sec, avg_hr, intensity_type
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    str(source_id),
+                    int(lap["lap"]),
+                    lap.get("distance_km"),
+                    lap.get("duration_sec"),
+                    lap.get("pace_sec"),
+                    lap.get("avg_hr"),
+                    lap.get("intensity_type"),
+                )
+                for lap in rows
+            ],
+        )
+        conn.commit()
+        return len(rows)
+
+
+def list_activity_laps(since: str | None = None, limit: int = 5000) -> list[sqlite3.Row]:
+    """Stored laps joined to their activity's date, newest first.
+
+    Only laps carrying both a pace and an HR are returned: a lap missing either
+    cannot be placed in a zone or scored for speed, and including it would let a
+    per-zone sample count claim evidence it does not have.
+    """
+    sql = """
+        SELECT l.*, a.activity_date
+        FROM activity_lap l
+        JOIN activities a ON a.source_id = l.source_id
+        WHERE l.pace_sec IS NOT NULL AND l.avg_hr IS NOT NULL
+    """
+    params: list = []
+    if since:
+        sql += " AND a.activity_date >= ?"
+        params.append(since)
+    sql += " ORDER BY a.activity_date DESC, l.lap ASC LIMIT ?"
+    params.append(limit)
+    with get_conn() as conn:
+        return conn.execute(sql, params).fetchall()
+
+
+def activities_missing_laps(limit: int = 25) -> list[sqlite3.Row]:
+    """Runs with no stored laps, newest first — the backfill work queue."""
+    with get_conn() as conn:
+        return conn.execute(
+            """
+            SELECT a.source_id, a.activity_date
+            FROM activities a
+            WHERE lower(a.activity_type) LIKE '%run%'
+              AND NOT EXISTS (SELECT 1 FROM activity_lap l WHERE l.source_id = a.source_id)
+            ORDER BY a.activity_date DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+
+def lap_coverage() -> dict:
+    """How much of the run history has stored laps — so a per-zone answer can say
+    what it is based on instead of implying it saw everything."""
+    with get_conn() as conn:
+        runs = conn.execute(
+            "SELECT COUNT(*) AS n FROM activities WHERE lower(activity_type) LIKE '%run%'"
+        ).fetchone()["n"]
+        with_laps = conn.execute(
+            """
+            SELECT COUNT(DISTINCT l.source_id) AS n
+            FROM activity_lap l
+            JOIN activities a ON a.source_id = l.source_id
+            """
+        ).fetchone()["n"]
+        laps = conn.execute("SELECT COUNT(*) AS n FROM activity_lap").fetchone()["n"]
+    return {"runs": runs, "runs_with_laps": with_laps, "laps": laps}
 
 
 def list_runs(limit: int = 200) -> list[sqlite3.Row]:
@@ -306,6 +423,21 @@ def list_planned_workouts(start_date: str, end_date: str) -> list[sqlite3.Row]:
             "SELECT * FROM planned_workout WHERE plan_date >= ? AND plan_date <= ? ORDER BY plan_date",
             (start_date, end_date),
         ).fetchall()
+
+
+def delete_planned_workout(plan_date: str) -> None:
+    """Drop a single planned day, but never one that is already completed —
+    deleting a completed row would orphan the actuals linked to it.
+
+    Used to hand an athlete-set day back to the plan: `materialize` refuses to
+    overwrite a non-rule row, so the row has to go before it can be rebuilt.
+    """
+    with get_conn() as conn:
+        conn.execute(
+            "DELETE FROM planned_workout WHERE plan_date = ? AND status != 'completed'",
+            (plan_date,),
+        )
+        conn.commit()
 
 
 def delete_planned_from(start_date: str) -> list[str]:
@@ -429,7 +561,11 @@ def save_activity_analysis(source_id: str, summary: str, sent_at: str | None = N
             """INSERT INTO activity_analysis (source_id, summary, sent_at, created_at)
                VALUES (?, ?, ?, ?)
                ON CONFLICT(source_id) DO UPDATE SET
-                 summary=excluded.summary, sent_at=excluded.sent_at""",
+                 summary=excluded.summary, sent_at=excluded.sent_at,
+                 -- A re-review replaces the text, so the timestamp has to move
+                 -- with it: leaving the first review's time on a later rewrite
+                 -- makes the row read as older than the words in it.
+                 created_at=excluded.created_at""",
             (source_id, summary, sent_at, _utcnow()),
         )
         conn.commit()
@@ -447,6 +583,13 @@ def list_unanalyzed_running_activities(limit: int = 5) -> list[sqlite3.Row]:
                LIMIT ?""",
             (limit,),
         ).fetchall()
+
+
+def get_activity(source_id: str) -> sqlite3.Row | None:
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT * FROM activities WHERE source_id=?", (source_id,)
+        ).fetchone()
 
 
 def get_activity_analysis(source_id: str) -> sqlite3.Row | None:

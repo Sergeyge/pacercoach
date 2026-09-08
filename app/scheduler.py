@@ -113,6 +113,42 @@ def _schedule_metrics_retry(attempt: int) -> bool:
     return True
 
 
+def _announce_morning(workout: dict | None, freshness: dict) -> None:
+    """Tell the athlete about today — but only when there is something to say and
+    this morning's own data backs it. Never raises.
+
+    Two silent cases, both written to `sync_log` so a quiet morning is never
+    mistaken for a notify outage:
+
+      * **No verified recovery data.** The 06:00 message reads as "we looked at
+        how you slept and this is today's session". Past MORNING_RETRY_UNTIL the
+        routine still adapts and pushes from training load alone — the watch must
+        not be left empty — but that prescription was never condition-checked, so
+        it is not announced. The dashboard still shows it.
+      * **Rest day.** Nothing prescribed to announce.
+    """
+    if not workout:
+        return
+    from .db import add_sync_log
+
+    if not freshness.get("fresh"):
+        reason = freshness.get("reason") or "watch had not synced since waking"
+        add_sync_log(
+            "info",
+            f"no verified recovery data by {settings.morning_retry_until} ({reason}); "
+            "today adapted from training load but not announced",
+            0,
+        )
+        return
+
+    from .notify import send_morning_summary
+
+    # `send_morning_summary` owns the rest-day rule, so the manual endpoint can
+    # still force one.
+    if send_morning_summary(workout).get("status") == "skipped_rest_day":
+        add_sync_log("info", "rest day — morning summary not sent", 0)
+
+
 def _morning_update(attempt: int = 1) -> None:
     """Each morning: refresh Garmin data, adapt today's workout, push it to the watch.
 
@@ -212,6 +248,20 @@ def _morning_update(attempt: int = 1) -> None:
     except Exception as exc:
         _log_exc("record_snapshot", exc)
 
+    # Warm the zone and fitness caches while we are already talking to Garmin.
+    # Both are read by the coach chat, which is cache-only on purpose: a cold
+    # zone read costs a time-in-zone call per recent activity and a cold fitness
+    # read six calls, and neither belongs in front of an athlete waiting on a
+    # reply. Failures are cached as failures, so this never blocks the morning.
+    try:
+        from .garmin_metrics import cached_fitness_summary
+        from .zones import hr_zones
+
+        hr_zones()
+        cached_fitness_summary()
+    except Exception as exc:
+        _log_exc("warm_zone_fitness_caches", exc)
+
     try:
         from .daily_coach import adapt_today, ensure_horizon
 
@@ -235,12 +285,9 @@ def _morning_update(attempt: int = 1) -> None:
         return
 
     try:
-        from .notify import send_morning_summary
-
-        if workout:
-            send_morning_summary(workout)
+        _announce_morning(workout, recovery[1])
     except Exception as exc:
-        _log_exc("send_morning_summary", exc)
+        _log_exc("announce_morning", exc)
         # Also surface to /sync/status so a chronic SMTP/notify outage isn't
         # invisible (user otherwise just stops getting emails with no signal).
         try:
@@ -250,8 +297,8 @@ def _morning_update(attempt: int = 1) -> None:
         except Exception as exc2:
             _log_exc("add_sync_log[notify]", exc2)
 
-    # The athlete has been told about today; from here on a restart must not
-    # repeat the routine even if the push below fails.
+    # Today has been handled — announced, or deliberately left unannounced. From
+    # here on a restart must not repeat the routine even if the push below fails.
     _mark_morning_done()
 
     if not settings.goal_auto_push or not workout:
@@ -366,3 +413,14 @@ def start_scheduler() -> None:
     )
     _schedule_catch_up_if_missed()
     scheduler.start()
+
+
+def next_sync_at() -> str | None:
+    """ISO timestamp of the next automatic Garmin sync, or None when auto-sync is off."""
+    try:
+        job = scheduler.get_job("garmin_sync")
+    except Exception as exc:
+        _log_exc("next_sync_at", exc)
+        return None
+    run_at = getattr(job, "next_run_time", None) if job else None
+    return run_at.isoformat() if run_at else None

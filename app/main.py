@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from .auth import require_api_key
-from .daily_coach import adapt_today, ensure_horizon
+from .daily_coach import ATHLETE_SOURCE, _plan_paces, adapt_today, cached_morning_metrics, ensure_horizon
 from .db import (
     add_coach_message,
     clear_coach_messages,
@@ -31,8 +31,8 @@ from .db import (
     upsert_activities,
 )
 from .garmin_client import GarminClientError
-from .garmin_extra import fetch_gear, fetch_last_splits
-from .garmin_metrics import fetch_fitness, fetch_recovery, fetch_snapshot
+from .garmin_extra import backfill_activity_laps, fetch_gear, fetch_last_splits
+from .garmin_metrics import cached_fitness_summary, fetch_fitness, fetch_recovery, fetch_snapshot
 from .goal_planner import (
     active_phase_context,
     build_and_store_plan,
@@ -49,9 +49,10 @@ from .openai_client import coach_answer, list_models, ping
 from .planner import generate_today_plan, generate_weekly_plan
 from .progress import _hms, build_report, estimate_eta
 from .readiness import calculate_readiness
-from .scheduler import start_scheduler
+from .scheduler import next_sync_at, start_scheduler
 from .settings import settings
 from .sync_service import run_garmin_sync
+from .zones import run_history, zone_report
 
 from .workout_publisher import (
     WorkoutPublishError,
@@ -172,6 +173,7 @@ def sync_status() -> dict:
     return {
         "auto_sync_enabled": settings.auto_sync_enabled,
         "sync_interval_minutes": settings.sync_interval_minutes,
+        "next_sync_at": next_sync_at(),
         "recent_syncs": [dict(r) for r in list_sync_log(limit=20)],
     }
 
@@ -313,6 +315,11 @@ def goal_week() -> dict:
             firmness = "paused"
         elif r["status"] == "completed":
             firmness = "done"
+        elif r["source"] == ATHLETE_SOURCE:
+            # Checked before the today branch: an athlete-set day does NOT adapt
+            # each morning, and saying it does would describe the opposite of
+            # what the lock guarantees.
+            firmness = "set by you"
         elif r["plan_date"] == today.isoformat():
             firmness = "today (adapts each morning)"
         elif r["source"] == "adapted":
@@ -459,7 +466,11 @@ def goal_today_recheck() -> dict:
 
 @app.post("/goal/today/notify")
 def goal_today_notify() -> dict:
-    """Send today's workout + coaching note as a morning summary (per NOTIFY_CHANNEL)."""
+    """Send today's workout + coaching note as a morning summary (per NOTIFY_CHANNEL).
+
+    Forces the send: the automated morning routine stays silent on rest days, but
+    pressing Notify is an explicit ask and must deliver something.
+    """
     if get_active_goal() is None:
         return JSONResponse(status_code=404, content={"error": "no active goal"})
     ds = date.today().isoformat()
@@ -473,7 +484,8 @@ def goal_today_notify() -> dict:
     # the bare kind label ("Quality") and contradict both the watch and the
     # morning job's own email for the same day.
     return send_morning_summary(
-        {**dict(row), "title": title_for(row["kind"], structure=row_structure(row, date.today()))}
+        {**dict(row), "title": title_for(row["kind"], structure=row_structure(row, date.today()))},
+        force=True,
     )
 
 
@@ -572,6 +584,15 @@ def analyze_new_now() -> dict:
     return analyze_new_runs_and_notify()
 
 
+@app.post("/activities/re-review")
+def re_review(source_id: str | None = Query(default=None)) -> dict:
+    """Regenerate the AI coach review for one run (default: the latest), replacing
+    the stored text. For when the coach got a session wrong."""
+    from .run_analyzer import re_review_run
+
+    return re_review_run(source_id=source_id)
+
+
 @app.get("/activities/last/splits")
 def last_splits() -> dict:
     try:
@@ -586,6 +607,29 @@ def gear() -> dict:
         return fetch_gear()
     except GarminClientError as exc:
         return JSONResponse(status_code=400, content={"status": "error", "error": str(exc)})
+
+
+@app.get("/zones")
+def zones(fresh: bool = False) -> dict:
+    """HR zones (from Garmin), the plan's pace targets, and the speed actually
+    run in each HR zone. The same payload the coach chat is grounded in.
+
+    `fresh=true` bypasses the ~24h zone cache — use it after editing your zones
+    in Garmin Connect.
+    """
+    return zone_report(fresh=fresh)
+
+
+@app.post("/activities/laps/backfill")
+def laps_backfill(limit: int = 25) -> dict:
+    """Import lap splits for past runs that have none.
+
+    New runs store their laps during sync automatically. This is for history from
+    before that, and is bounded per call (one Garmin request per activity) so a
+    long history is worked through in deliberate batches rather than one burst
+    that earns an HTTP 429. Re-call until `remaining` reaches 0.
+    """
+    return backfill_activity_laps(limit=limit)
 
 
 class AskIn(BaseModel):
@@ -604,11 +648,23 @@ def coach_ask(body: AskIn) -> dict:
     today = date.today()
     tw = get_planned_workout(today.isoformat())
     runs = [dict(r) for r in list_runs(limit=500)]
-    readiness = calculate_readiness(runs, today=today)
+    # Score readiness from this morning's recovery data, not from training load
+    # alone. The cached read is deliberate: it is the very snapshot the morning
+    # adaptation used, and it costs no Garmin login — without it every chat answer
+    # carried "no recovery metrics available" even when the 06:00 job had already
+    # verified and scored the morning.
+    metrics, metrics_freshness = cached_morning_metrics(today)
+    readiness = calculate_readiness(runs, today=today, metrics=metrics)
     recent = list_planned_workouts((today - timedelta(days=7)).isoformat(), (today - timedelta(days=1)).isoformat())
     # Upcoming 14 days so the coach can reference real dates when proposing
     # a plan change (move/shorten/rest a specific day).
     upcoming = list_planned_workouts(today.isoformat(), (today + timedelta(days=13)).isoformat())
+    # The plan's own pace targets. The morning coach has always received these as
+    # `plan_paces_sec_per_km`; the chat coach did not, which is why it could not
+    # answer a question about the athlete's own zones or paces.
+    # Cache-only: a chat turn must never block on Garmin. The morning job primes
+    # both caches, so in normal operation these are full reads.
+    zone_data = zone_report(today=today, allow_fetch=False)
     context = {
         "today_date": today.isoformat(),
         "goal": {"distance_km": g["distance_km"], "target_seconds": g["target_seconds"], "race_date": g["race_date"]},
@@ -617,13 +673,43 @@ def coach_ask(body: AskIn) -> dict:
         "pause_reason": g["pause_reason"],
         "pause_until": g["pause_until"],
         "today": dict(tw) if tw else None,
-        "readiness": {"score": readiness.score, "status": readiness.status, "reasons": readiness.reasons},
+        "readiness": {
+            "score": readiness.score,
+            "status": readiness.status,
+            "reasons": readiness.reasons,
+            "from_recovery_metrics": readiness.physiological,
+        },
+        "morning_metrics": metrics,
+        "morning_metrics_freshness": metrics_freshness,
+        "plan_paces_sec_per_km": _plan_paces(),
+        "hr_zones": zone_data["hr_zones"],
+        "hr_zones_source": zone_data["hr_zones_source"],
+        "hr_zones_error": zone_data["hr_zones_error"],
+        "pace_targets": zone_data["pace_targets"],
+        "observed_speed_by_hr_zone": zone_data["observed_speed_by_hr_zone"],
+        "run_history": run_history(runs, today=today),
+        "fitness": cached_fitness_summary(allow_fetch=False),
         "recent_results": [
-            {"date": r["plan_date"], "kind": r["kind"], "planned_km": r["distance_km"], "status": r["status"], "actual_km": r["actual_distance_km"]}
+            {
+                "date": r["plan_date"], "kind": r["kind"], "planned_km": r["distance_km"],
+                "status": r["status"], "actual_km": r["actual_distance_km"],
+                # The morning coach has always had the achieved pace; chat only
+                # ever saw the distance, so it could not tell a session executed
+                # on target from one run far off it.
+                "actual_pace_sec": r["actual_pace_sec"],
+                "structure": row_structure(r, date.fromisoformat(str(r["plan_date"]))),
+            }
             for r in recent
         ],
+        # `athlete_set` marks days the athlete fixed in chat: the coach needs to
+        # know a day is already locked to answer about it honestly and to offer
+        # follow_plan instead of proposing an adjustment that changes nothing.
         "upcoming_plan": [
-            {"date": r["plan_date"], "kind": r["kind"], "distance_km": r["distance_km"], "status": r["status"]}
+            {
+                "date": r["plan_date"], "kind": r["kind"], "distance_km": r["distance_km"],
+                "target_pace_sec": r["target_pace_sec"], "status": r["status"],
+                "athlete_set": r["source"] == ATHLETE_SOURCE,
+            }
             for r in upcoming
         ],
     }

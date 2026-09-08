@@ -5,15 +5,17 @@ from typing import Any
 from .garmin_client import get_garmin_client
 
 
-def fetch_last_splits() -> dict[str, Any]:
-    """Per-km/lap splits of the most recent stored run."""
-    from .db import list_runs
+def fetch_activity_splits(activity_id: Any, client: Any | None = None) -> dict[str, Any]:
+    """Per-lap splits of one activity.
 
-    runs = list_runs(limit=1)
-    if not runs:
-        return {"error": "no runs synced yet"}
-    activity_id = runs[0]["source_id"]
-    client = get_garmin_client()
+    `client` lets a caller reuse one logged-in Garmin client across several
+    activities instead of paying for a login per call. Garmin's own per-lap
+    `intensityType` is carried through: on a run that followed a structured
+    workout it marks warm-up / work / recovery / cool-down laps, which is what
+    lets a review judge the work reps instead of the blended whole-run average.
+    """
+    if client is None:
+        client = get_garmin_client()
     try:
         data = client.get_activity_splits(activity_id)
     except Exception as exc:
@@ -29,13 +31,74 @@ def fetch_last_splits() -> dict[str, Any]:
         out.append(
             {
                 "lap": i,
-                "distance_km": round((dist or 0) / 1000, 2),
+                # 3 dp, not 2: a 20-second stride lap is ~80 m, and rounding that
+                # to 0.08 km skews any pace averaged over the reps by several
+                # percent. The dashboard formats it back down for display.
+                "distance_km": round((dist or 0) / 1000, 3),
                 "duration_sec": round(dur) if dur else None,
                 "pace_sec": pace,
                 "avg_hr": int(hr) if hr else None,
+                "intensity_type": lap.get("intensityType"),
             }
         )
-    return {"activity_id": activity_id, "date": runs[0]["activity_date"], "laps": out}
+    return {"activity_id": activity_id, "laps": out}
+
+
+def fetch_last_splits() -> dict[str, Any]:
+    """Per-km/lap splits of the most recent stored run."""
+    from .db import list_runs
+
+    runs = list_runs(limit=1)
+    if not runs:
+        return {"error": "no runs synced yet"}
+    out = fetch_activity_splits(runs[0]["source_id"])
+    if "error" not in out:
+        out["date"] = runs[0]["activity_date"]
+    return out
+
+
+def backfill_activity_laps(limit: int = 25) -> dict[str, Any]:
+    """Fetch and store laps for past runs that have none, newest first.
+
+    New activities get their laps stored during sync (the review already fetches
+    them), so this is only for history predating that. Deliberately bounded and
+    manually triggered rather than run on a schedule: it costs one Garmin call
+    per activity, and a few hundred in a burst is exactly what earns the HTTP 429
+    that `garmin_client` caches tokens to avoid. Call it repeatedly to work back
+    through the history.
+    """
+    from .db import activities_missing_laps, lap_coverage, upsert_activity_laps
+
+    pending = activities_missing_laps(limit=max(1, min(limit, 100)))
+    if not pending:
+        return {"status": "ok", "fetched": 0, "message": "every run already has laps", "coverage": lap_coverage()}
+
+    try:
+        client = get_garmin_client()
+    except Exception as exc:
+        return {"status": "error", "error": f"{type(exc).__name__}: {exc}"[:200], "coverage": lap_coverage()}
+
+    stored, failed = 0, []
+    for row in pending:
+        sid = str(row["source_id"])
+        data = fetch_activity_splits(sid, client=client)
+        laps = data.get("laps")
+        if not laps:
+            failed.append({"source_id": sid, "date": row["activity_date"], "reason": data.get("error") or "no laps"})
+            continue
+        try:
+            upsert_activity_laps(sid, laps)
+            stored += 1
+        except Exception as exc:
+            failed.append({"source_id": sid, "date": row["activity_date"], "reason": f"{type(exc).__name__}: {exc}"[:120]})
+
+    return {
+        "status": "ok",
+        "fetched": stored,
+        "failed": failed,
+        "remaining": len(activities_missing_laps(limit=100)),
+        "coverage": lap_coverage(),
+    }
 
 
 def _profile_number(client) -> Any:

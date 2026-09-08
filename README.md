@@ -161,13 +161,19 @@ APScheduler job runs (while the goal is paused, the adapt/notify/push steps
 are skipped — with auto-resume on the day after `pause_until`):
 
 1. **Freshness gate first.** `morning_metrics()` reads this morning's Garmin
-   recovery metrics and checks the calendar stamp on each post-sleep signal
-   (training readiness, sleep, HRV). Unless at least one is confirmed to be
-   *today's*, the job stops here and reschedules itself every
+   recovery metrics and applies two tests to each post-sleep signal (training
+   readiness, sleep, HRV): its calendar stamp must be *today's*, **and** it must
+   have been produced at or after `sleepEndTimestampGMT` — the instant you woke.
+   The second test is not redundant: Garmin stamps an overnight readiness record
+   with today's date from midnight, so a date check alone accepted a provisional
+   score computed while you were still asleep. Anything older than the wake
+   instant is listed under `pre_wake` and ignored, and while the night is still
+   open nothing is fresh at all. Unless at least one signal passes both tests,
+   the job stops here and reschedules itself every
    `MORNING_RETRY_MINUTES` until `MORNING_RETRY_UNTIL` — nothing below runs, so
    no email is sent, nothing is written, and a workout already on your watch is
-   left alone. Stale, undatable and missing metrics are dropped rather than
-   scored: readiness cannot tell yesterday's sleep score from today's, so a
+   left alone. Stale, pre-wake, undatable and missing metrics are dropped rather
+   than scored: readiness cannot tell yesterday's sleep score from today's, so a
    two-day-old bad night must not cancel today's session.
 2. `run_garmin_sync(days=45, notify_analysis=False)` — pulls latest activities;
    run-review analyses on new activities are saved to the DB but NOT emailed
@@ -176,17 +182,26 @@ are skipped — with auto-resume on the day after `pause_until`):
 4. `adapt_today(recovery=…)` — scores readiness from the verified metrics plus
    training load, calls the OpenAI coach with safe bounds, falls back to rules;
    writes the adapted workout to `planned_workout`. A day already marked
-   completed is returned untouched.
+   completed is returned untouched, and so is a day you set yourself in coach
+   chat — that one still gets a readiness note, but not a new prescription.
 5. `send_morning_summary(workout)` — emails the day's session name, prescription
    and coach note (via Gmail SMTP, CallMeBot WhatsApp, or skipped per
-   `NOTIFY_CHANNEL`)
+   `NOTIFY_CHANNEL`). Two mornings stay **silent**, each recorded as a
+   `sync_log("info", …)` row so a quiet morning is distinguishable from a notify
+   outage: **rest days** (nothing prescribed to announce) and **mornings that
+   reached the cutoff without verified recovery data** — the session is still
+   adapted and pushed from training load, but it was never condition-checked, so
+   it is not announced as if it had been
 6. Auto-pushes the adapted workout to Garmin (skipped on rest days). On
    schedule failure, writes a `sync_log("warn", …)` row and does NOT mark
    pushed — so next run retries
 
-At the cutoff the job proceeds regardless and the coach note names the actual
-cause — watch not synced, data from an earlier day, unconfirmable, or Garmin
-refusing the requests (which needs re-authorising, not a re-sync). The retry
+At the cutoff the job proceeds regardless — adapting and pushing from training
+load alone, with the coach note naming the actual cause: watch not synced, data
+from an earlier day, unconfirmable, or Garmin refusing the requests (which needs
+re-authorising, not a re-sync). That prescription reaches the watch and the
+dashboard but is **not** emailed: the morning message means "your condition was
+checked", so it only goes out once this morning's Garmin data really has landed. The retry
 chain is also capped at whatever fits the window, with an absolute ceiling of 48
 attempts so a misconfigured interval can't loop.
 
@@ -209,10 +224,15 @@ button and the scheduler never uses it.)
 
 ### What the coach may change
 
-The OpenAI layer is bounded by the rules, not trusted over them. It can never
-prescribe a **harder** session than the rules did, and on a morning readiness
-didn't flag it cannot change the session type at all — only tune volume within a
-band.
+This governs the **automatic** morning layer — the OpenAI call that adapts today
+on its own initiative. It is bounded by the rules, not trusted over them: it can
+never prescribe a **harder** session than the rules did, and on a morning
+readiness didn't flag it cannot change the session type at all — only tune volume
+within a band.
+
+What *you* ask for in chat is not bound by any of this. An athlete-set day
+outranks both the rules and this layer, and never reaches it — see
+[Coach chat](#coach-chat-with-plan-edits).
 
 | Bound | Readiness green (nothing eased) | Volume eased (yellow, type kept) | Type eased (yellow demotion / red) |
 |---|---|---|---|
@@ -228,10 +248,12 @@ the coach can go further down but not back up. A base-phase strides day is
 different: it already runs at easy pace, so readiness trims its volume without
 changing its type, and the type stays locked.
 
-The pace is never taken from the coach — it is the prescription for a kind, and
-accepting it separately let an "easy" day be run at threshold. A zero distance on
-a run kind is normalised to `rest` rather than stored as an incoherent
-"quality, 0 km", which every push path would have treated as a rest day anyway.
+The pace is never taken from the automatic coach — it is the prescription for a
+kind, and accepting it separately let an "easy" day be run at threshold. (You can
+still set a pace yourself in chat; the athlete may, the morning layer may not.) A
+zero distance on a run kind is normalised to `rest` rather than stored as an
+incoherent "quality, 0 km", which every push path would have treated as a rest
+day anyway.
 
 Anything the bounds reject is replaced by the plan's value, and the coach's prose
 and note are replaced along with it, so the stored day never describes a change
@@ -251,10 +273,27 @@ queues them through the OpenAI coach for a per-activity professional summary.
 The review is judged against the **training plan**, not just the race goal:
 the coach gets the day's planned session (kind/distance/target pace/details),
 the plan's pace map, the current phase position, and the next 7 planned days
-(with natural labels — "tomorrow", "Wednesday"). So an easy run is compared to
+(with natural labels — "tomorrow", "Friday", and "next Wednesday" for the
+seventh day, which is always the reviewed run's own weekday coming round again:
+a bare "Wednesday" there pointed the takeaway at the session just finished). So
+an easy run is compared to
 its easy target instead of being called slow against race pace, and the
 takeaway names the athlete's actual next session. Runs on days with no planned
-workout are flagged as unplanned and assessed on their own merits. The
+workout are flagged as unplanned and assessed on their own merits.
+
+On a **structured** day the review works from the **lap splits**, not the
+whole-run average. A tempo/interval session's average pace blends the work reps
+with the warm-up, jog recoveries and cool-down, so a perfectly executed
+3 x 8 min at 5:36/km inside an 8.6 km session still averages out near easy pace —
+comparing the two once produced a review that called a well-run tempo day
+"33 s/km slower than target". `lap_review` tags each lap (warm-up / work /
+recovery / cool-down / easy body) from Garmin's own per-lap `intensityType`,
+falling back to matching lap durations against the prescribed rep length, and
+hands the coach the reps' measured paces with the deltas already computed. When
+the reps cannot be identified the coach is told so explicitly and judges the
+session on distance, duration and HR rather than on the average. Strides are
+tagged too but carry no pace target — they are run fast by feel. The morning
+coach gets the same warning about `recent_results[].actual_pace_sec`. The
 analysis row is **saved BEFORE the email is sent** so the once-per-activity
 guarantee holds even if SMTP retries. The dashboard's *Last Run · AI Coach
 Review* card shows the most recent one.
@@ -272,13 +311,36 @@ the `app_config` table; `POST /goal` bypasses the cache.
 ### Coach chat (with plan edits)
 
 `POST /goal/coach/ask` — free-form question, grounded in your goal, phase
-roadmap position, today's workout, the upcoming 14 days, recent results and
-readiness, plus the persisted chat history (last ~25 exchanges, stored in
-`coach_message`). When you clearly ask for a plan change ("make today easier",
-"move my long run to Sunday"), the coach returns a `proposed_change`
-(adjust_day / rest_day / swap_days) which the dashboard renders as a
-confirm card; `POST /goal/coach/apply` validates it (future dates only,
-bounded kinds/distances) and re-pushes affected days to Garmin.
+roadmap position, today's workout, the upcoming 14 days (with the days you have
+already set marked), recent results and readiness, plus the persisted chat
+history (last ~25 exchanges, stored in `coach_message`). When you clearly ask for
+a plan change ("make today easier", "move my long run to Sunday", "make today
+12 km", "run tomorrow at 5:10/km"), the coach returns a `proposed_change`
+(adjust_day / rest_day / swap_days / follow_plan) which the dashboard renders as
+a confirm card; `POST /goal/coach/apply` validates it and re-pushes affected days
+to Garmin. Nothing is applied until you tap **Apply change**.
+
+**Chat is the top of the hierarchy.** When you ask for a specific distance or
+pace, that is the session — the coach is instructed to propose exactly your
+number, voice any disagreement in its answer rather than in the numbers, and
+never quietly round it back toward the plan.
+
+- `adjust_day` now carries `target_pace_sec` (seconds per km), so a pace request
+  reaches the watch. Fields you don't ask to change keep their current value: a
+  pace-only request leaves the distance alone, and a later distance-only request
+  keeps the pace you set.
+- An applied day is stored with `source="athlete"` and is **locked**: the morning
+  adaptation returns it exactly as set (`engine="athlete-set"`) instead of
+  trimming it for readiness. It still gets a readiness note — *"readiness is red
+  (HRV low) — left as you set it, but the plan would have called today off"* —
+  rebuilt each morning so re-checks don't stack copies of it. The dashboard marks
+  the day **yours** / *Set by you*.
+- `follow_plan` is the release valve: "put Thursday back on plan" drops the
+  athlete row, re-materializes the plan's own day and lets the morning
+  adaptation manage it again.
+- What still applies: dates within the 28-day edit horizon and not in the past,
+  no edits to a completed day, distance clamped to the plan cap and pace to
+  2:30–15:00/km. Those are typo guards, not coaching opinions.
 
 ### Pause / resume
 
@@ -315,6 +377,7 @@ All endpoints require `X-API-Key` except `/`, `/dashboard`, `/health`,
 | GET | `/sync/status` | — | Auto-sync config + recent sync-log entries. |
 | POST | `/import/garmin-csv` | `distance_unit=km`, `file`* | Import historical runs from a Garmin CSV export. |
 | GET | `/activities/runs` | `limit=50` | List stored running activities. |
+| POST | `/activities/re-review` | `source_id` (optional) | Regenerate one run's coach review (default: the latest), replacing the stored text. |
 | GET | `/activities/last/splits` | — | Per-lap splits of your most recent run. |
 | GET | `/activities/last/analysis` | — | Most recent AI coach review. |
 | POST | `/activities/analyze-new` | `limit=5` | Force the analyze hook (skips already-analyzed). |
@@ -342,7 +405,7 @@ All endpoints require `X-API-Key` except `/`, `/dashboard`, `/health`,
 | GET | `/goal/stats` | `days=30` | Consistency (% of run days completed + streak). |
 | GET | `/goal/eta` | `fresh=false` | LLM completion-date estimate + explanation (`?fresh=true` bypasses 6h cache). |
 | POST | `/goal/coach/ask` | `{question}` | Ask the coach; may return a `proposed_change` for confirmation. |
-| POST | `/goal/coach/apply` | `{change}` | Apply a confirmed coach-proposed change (bounded; re-pushes Garmin days). |
+| POST | `/goal/coach/apply` | `{change}` | Apply a confirmed change — `adjust_day` (kind/distance/`target_pace_sec`), `rest_day`, `swap_days`, `follow_plan`. Locks the day to `source="athlete"`; re-pushes Garmin days. |
 | GET | `/goal/coach/history` | `limit=50` | Persisted coach chat, oldest first. |
 | DELETE | `/goal/coach/history` | — | Clear the persisted coach chat. |
 | POST | `/goal/pause` | `{reason?, until?}` | Pause morning adapt + auto-push; optional auto-resume date. |
@@ -351,7 +414,7 @@ All endpoints require `X-API-Key` except `/`, `/dashboard`, `/health`,
 | POST | `/goal/today/refresh` | `live=true` | Force the adaptive recompute now. |
 | POST | `/goal/today/recheck` | — | Re-read this morning's recovery metrics, re-adapt today from them, and push the result to the watch. Reports `metrics_freshness`. |
 | POST | `/goal/today/push` | — | Push today's workout to Garmin (skips rest days). |
-| POST | `/goal/today/notify` | — | Send today's workout via the configured channel. |
+| POST | `/goal/today/notify` | — | Send today's workout via the configured channel (sends on rest days too, unlike the morning job). |
 | POST | `/goal/week/push` | `days=7`, `force=false` | Push next N days to Garmin; `force=true` deletes old then re-pushes. API-only — no UI, and the morning job never calls it. |
 
 ### Live Garmin metrics

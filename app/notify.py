@@ -11,6 +11,11 @@ from typing import Any
 from .settings import settings
 
 
+def is_rest_day(workout: dict[str, Any]) -> bool:
+    """Nothing to run today — an explicit rest day, or a session zeroed by the adapter."""
+    return workout.get("kind") == "rest" or float(workout.get("distance_km") or 0) <= 0
+
+
 def format_summary(workout: dict[str, Any]) -> str:
     """One short message: today's session + coaching note + readiness."""
     d = workout.get("date") or workout.get("plan_date") or date.today().isoformat()
@@ -27,7 +32,7 @@ def format_summary(workout: dict[str, Any]) -> str:
     dist = float(workout.get("distance_km") or 0)
     pace = workout.get("target_pace_sec")
     pace_txt = f" @ {int(pace) // 60}:{int(pace) % 60:02d}/km" if pace else ""
-    line = "Rest day" if (workout.get("kind") == "rest" or dist <= 0) else f"{kind} — {dist:g} km{pace_txt}"
+    line = "Rest day" if is_rest_day(workout) else f"{kind} — {dist:g} km{pace_txt}"
 
     parts = [f"\U0001F3C3 Today · {dow}", line]
     details = workout.get("details")
@@ -104,7 +109,7 @@ def morning_email_html(workout: dict[str, Any]) -> str:
     pace_txt = f"{int(pace) // 60}:{int(pace) % 60:02d}/km" if pace else ""
     body = "<div class=\"eyebrow\">Today's session</div>"
     body += f"<div class=\"title\">{dow}</div>"
-    if workout.get("kind") == "rest" or dist <= 0:
+    if is_rest_day(workout):
         body += "<div class=\"stat\"><span class=\"accent\">Rest day</span> &mdash; recover, hydrate, light mobility.</div>"
     else:
         stat = f"<span class=\"accent\">{_escape(str(kind))}</span> &middot; {dist:g} km"
@@ -216,9 +221,17 @@ def current_channel() -> str:
     return (get_config("notify_channel", settings.notify_channel) or "none").lower()
 
 
-def send_morning_summary(workout: dict[str, Any]) -> dict[str, Any]:
-    """Dispatch the morning summary on the configured channel. Never raises."""
+def send_morning_summary(workout: dict[str, Any], force: bool = False) -> dict[str, Any]:
+    """Dispatch the morning summary on the configured channel. Never raises.
+
+    Rest days are silent: there is no prescription to deliver, and a daily "Rest
+    day" message trains the athlete to stop opening the channel. `force=True` is
+    for an explicit request (the dashboard's Notify button), where silence would
+    read as a broken button rather than as an intentional skip.
+    """
     text = format_summary(workout)
+    if is_rest_day(workout) and not force:
+        return {"status": "skipped_rest_day", "message": text}
     channel = current_channel()
     if channel in ("", "none"):
         return {"status": "disabled", "channel": channel, "message": text}

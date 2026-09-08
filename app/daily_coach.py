@@ -7,6 +7,7 @@ from typing import Any
 
 from .db import (
     clear_garmin_pushed,
+    delete_planned_workout,
     get_active_goal,
     get_active_plan,
     get_planned_workout,
@@ -45,6 +46,69 @@ from .readiness import calculate_readiness
 ALLOWED_KINDS = ["rest", "recovery", "easy", "long", "quality"]
 _HARDNESS = {kind: rank for rank, kind in enumerate(ALLOWED_KINDS)}
 
+# `source` value for a day the athlete set themselves in coach chat. It outranks
+# both the rule projection and the morning AI adaptation: what the athlete asks
+# for in chat IS the session, so `adapt_today` leaves such a day exactly as set
+# and only records what readiness makes of it. Without this the athlete could ask
+# for a session, watch it land on the watch, and find it quietly trimmed the next
+# morning — the plan answering back to a decision they had already made.
+ATHLETE_SOURCE = "athlete"
+
+# The athlete's note and the morning's readiness comment share one field, so the
+# comment is fenced behind a marker: the morning pass rebuilds everything after
+# it, which keeps a re-adapt from stacking a second copy onto the first.
+_ATHLETE_NOTE = "You set this session in coach chat."
+_ADVISORY_MARK = "Readiness note:"
+
+# Sanity band on an athlete-requested pace (sec/km). 2:30/km is faster than the
+# world record and 15:00/km is a walk, so a value outside this is a typo or a
+# unit mix-up, not a request — the only bound left on a pace the athlete chose.
+_PACE_MIN_SEC = 150
+_PACE_MAX_SEC = 900
+
+# Today's recovery read, kept so a reader that is not the morning job can score
+# readiness physiologically without paying for its own Garmin login. The morning
+# routine calls `morning_metrics` on every attempt, so by the time the athlete
+# opens the dashboard or the coach chat this normally holds the very snapshot the
+# morning decision was made from — which is the point: the chat coach explaining
+# today should be looking at the same data that set it, not at a second opinion
+# fetched seconds later.
+_RECOVERY_CACHE_KEY = "morning_metrics_cache"
+
+
+def _cache_recovery(day: str, metrics: dict[str, Any], freshness: dict[str, Any]) -> None:
+    try:
+        from .db import set_config
+
+        set_config(_RECOVERY_CACHE_KEY, json.dumps({"date": day, "metrics": metrics, "freshness": freshness}))
+    except Exception as exc:
+        print(f"[daily_coach._cache_recovery] {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+
+
+def cached_morning_metrics(today: date | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Today's cached recovery snapshot, or an empty one if nothing is cached yet.
+
+    Deliberately does NOT fall back to a live fetch: callers use this precisely
+    because they must not trigger a Garmin login, and a silent fetch here would
+    put one in front of every chat turn. A cache entry from an earlier day is
+    ignored rather than returned — `calculate_readiness` cannot tell yesterday's
+    sleep score from today's, the same reason `morning_metrics` filters by date.
+    """
+    from .garmin_metrics import no_freshness
+
+    today = today or date.today()
+    try:
+        from .db import get_config
+
+        raw = get_config(_RECOVERY_CACHE_KEY)
+        if raw:
+            entry = json.loads(raw)
+            if entry.get("date") == today.isoformat():
+                return entry.get("metrics") or {}, entry.get("freshness") or no_freshness("cache held no freshness report")
+    except Exception as exc:
+        print(f"[daily_coach.cached_morning_metrics] {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+    return {}, no_freshness("no recovery snapshot cached for today yet")
+
 
 def ensure_horizon(today: date | None = None, days: int = 14) -> None:
     """Make sure the next `days` of rule-based workouts exist."""
@@ -55,6 +119,19 @@ def ensure_horizon(today: date | None = None, days: int = 14) -> None:
 
 
 def morning_metrics(today: date | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Live Garmin recovery snapshot + freshness report, cached for other readers.
+
+    Thin wrapper over `_morning_metrics_live`; see there for the freshness rules.
+    Every outcome is cached, failures included, so `cached_morning_metrics` can
+    tell "nobody has looked yet" from "we looked and Garmin refused".
+    """
+    today = today or date.today()
+    metrics, freshness = _morning_metrics_live(today)
+    _cache_recovery(today.isoformat(), metrics, freshness)
+    return metrics, freshness
+
+
+def _morning_metrics_live(today: date | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
     """Best-effort live Garmin recovery snapshot, plus a freshness report.
 
     Returns `(summary, freshness)`. Only metrics that `recovery_freshness`
@@ -85,7 +162,7 @@ def morning_metrics(today: date | None = None) -> tuple[dict[str, Any], dict[str
         )
         if freshness["errors"]:
             print(
-                f"[daily_coach.morning_metrics] Garmin refused recovery calls: {freshness['errors']}",
+                f"[daily_coach._morning_metrics_live] Garmin refused recovery calls: {freshness['errors']}",
                 file=sys.stderr,
                 flush=True,
             )
@@ -117,7 +194,7 @@ def morning_metrics(today: date | None = None) -> tuple[dict[str, Any], dict[str
         # meaning two different things.
         if not has_verified_signal(summary):
             print(
-                f"[daily_coach.morning_metrics] {freshness['have']} carried no scoreable value; "
+                f"[daily_coach._morning_metrics_live] {freshness['have']} carried no scoreable value; "
                 "treating this morning as not yet synced",
                 file=sys.stderr,
                 flush=True,
@@ -133,7 +210,7 @@ def morning_metrics(today: date | None = None) -> tuple[dict[str, Any], dict[str
         # on their own.
         return summary, freshness
     except Exception as exc:
-        print(f"[daily_coach.morning_metrics] {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+        print(f"[daily_coach._morning_metrics_live] {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
         reason = f"{type(exc).__name__}: {exc}"[:200]
         return {}, no_freshness(reason, errors={"garmin": reason})
 
@@ -146,6 +223,11 @@ def _blind_disclosure(freshness: dict[str, Any] | None) -> str:
         return (
             "(Garmin refused this morning's recovery requests, so this reflects training load only "
             "— the connection may need re-authorising rather than your watch re-syncing.)"
+        )
+    if f.get("pre_wake") and not f.get("have"):
+        return (
+            "(This morning's recovery picture hadn't been written yet — everything Garmin held for "
+            "today predated you waking up — so this reflects training load only.)"
         )
     if f.get("reason"):
         # A whole-call failure, or a payload that arrived but scored nothing.
@@ -209,16 +291,29 @@ def _recent_results(today: date, days: int = 7) -> list[dict[str, Any]]:
     end = (today - timedelta(days=1)).isoformat()
     out = []
     for r in list_planned_workouts(start, end):
-        out.append(
-            {
-                "date": r["plan_date"],
-                "kind": r["kind"],
-                "planned_km": r["distance_km"],
-                "status": r["status"],
-                "actual_km": r["actual_distance_km"],
-                "actual_pace_sec": r["actual_pace_sec"],
-            }
-        )
+        row = {
+            "date": r["plan_date"],
+            "kind": r["kind"],
+            "planned_km": r["distance_km"],
+            "status": r["status"],
+            "actual_km": r["actual_distance_km"],
+            "actual_pace_sec": r["actual_pace_sec"],
+        }
+        # A structured day's stored pace is the whole activity's average — reps
+        # blended with warm-up, jog recoveries and cool-down — so it is always far
+        # slower than that day's rep target even when every rep was on target.
+        # Name the shape so the model reads the number for what it is instead of
+        # easing today over a quality session that was actually executed.
+        try:
+            plan_day = date.fromisoformat(str(r["plan_date"]))
+        except ValueError:
+            plan_day = None
+        if plan_day is not None:
+            structure = row_structure(r, plan_day)
+            if structure:
+                row["structure"] = structure
+                row["actual_pace_is_whole_run_average"] = True
+        out.append(row)
     return out
 
 
@@ -429,6 +524,62 @@ def _merge_clamp(
     return {"kind": kind, "distance_km": dist, "target_pace_sec": pace, "details": details, "coach_note": note}
 
 
+def _readiness_advisory(readiness) -> str:
+    """What the rules would have done to an athlete-set day, said out loud.
+
+    An athlete-set session is not adjusted, so this is the only place the morning
+    verdict can still reach the athlete. Saying nothing on a green day keeps the
+    note quiet when there is nothing to warn about.
+    """
+    if readiness.status == "green":
+        return ""
+    reasons = "; ".join(readiness.reasons[:2]) if readiness.reasons else f"score {readiness.score}"
+    if readiness.status == "red":
+        return f"readiness is red ({reasons}) — left as you set it, but the plan would have called today off."
+    return f"readiness is yellow ({reasons}) — left as you set it, but the plan would have trimmed it."
+
+
+def _athlete_set_today(
+    base: dict[str, Any],
+    ds: str,
+    today: date,
+    readiness,
+    metrics: dict[str, Any],
+    freshness: dict[str, Any],
+) -> dict[str, Any]:
+    """Today exactly as the athlete set it in coach chat, plus a readiness note.
+
+    The session, its distance and its pace are returned untouched — this is the
+    whole point of `ATHLETE_SOURCE`. Only `coach_note` is rewritten, and only
+    after the previous advisory is stripped, so the row stays idempotent under
+    repeated morning passes and manual re-checks.
+    """
+    stored = (base["coach_note"] or _ATHLETE_NOTE).split(_ADVISORY_MARK)[0].strip()
+    advisory = _readiness_advisory(readiness)
+    note = f"{stored} {_ADVISORY_MARK} {advisory}" if advisory else stored
+    structure = row_structure(base, today)
+    if note != (base["coach_note"] or ""):
+        upsert_planned_workout(
+            ds, base["kind"], base["distance_km"], base["target_pace_sec"], base["details"],
+            source=ATHLETE_SOURCE, coach_note=note, status="planned", structure=base.get("structure") or None,
+        )
+    return {
+        "date": ds,
+        "kind": base["kind"],
+        "distance_km": base["distance_km"],
+        "target_pace_sec": base["target_pace_sec"],
+        "details": base["details"],
+        "coach_note": note,
+        "source": ATHLETE_SOURCE,
+        "title": title_for(base["kind"], structure=structure),
+        "structure": structure,
+        "engine": "athlete-set",
+        "readiness": readiness.__dict__,
+        "metrics_freshness": freshness,
+        "morning_metrics": metrics,
+    }
+
+
 def adapt_today(
     today: date | None = None,
     use_live_metrics: bool = True,
@@ -498,6 +649,13 @@ def adapt_today(
     recent = _recent_results(today)
     phase_ctx = phase_context(prog, today)
     phase = phase_ctx.get("phase") if phase_ctx else None
+
+    # The athlete set this day themselves, so it is not up for adaptation: return
+    # it as asked. This has to come BEFORE the strides-pace correction and the
+    # rule/AI layers below, every one of which would otherwise overwrite the pace
+    # or the distance the athlete chose.
+    if base["source"] == ATHLETE_SOURCE:
+        return _athlete_set_today(base, ds, today, readiness, metrics, metrics_freshness)
 
     # A strides day's body is easy pace by definition. Rows written before that
     # rule existed — and rows the projection refresh won't touch because they are
@@ -683,6 +841,29 @@ def _validate_date(ds: Any, today: date) -> str | None:
     return d.isoformat()
 
 
+def _validate_pace(value: Any) -> int | None:
+    """An athlete-requested pace in seconds per km, or None when none was asked for.
+
+    Accepts "5:10" as well as 310 — the chat model is told to send seconds, but a
+    request the athlete phrased in mm:ss is not worth losing to a format slip.
+    Out-of-band values are clamped rather than rejected: the athlete's number is
+    the authority, the band only catches typos and unit mix-ups.
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, str) and ":" in value:
+        try:
+            mins, secs = value.strip().split(":")[:2]
+            value = int(mins) * 60 + int(secs)
+        except (TypeError, ValueError):
+            return None
+    try:
+        pace = int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
+    return max(_PACE_MIN_SEC, min(pace, _PACE_MAX_SEC))
+
+
 def _repush_if_needed(plan_date: str) -> dict[str, Any] | None:
     """If a date already has a Garmin workout, delete it and push the new
     version so the watch reflects the edit. Returns a small status dict or None
@@ -740,13 +921,16 @@ def apply_plan_change(change: dict[str, Any], today: date | None = None) -> dict
         ds = _validate_date(change.get("date"), today)
         if ds is None:
             return {"status": "rejected", "reason": f"date out of range or invalid: {change.get('date')!r}"}
+        existing = get_planned_workout(ds)
+        if existing is not None and existing["status"] == "completed":
+            return {"status": "rejected", "reason": f"{ds} is already completed"}
+        requested_pace = _validate_pace(change.get("target_pace_sec"))
         if action == "rest_day":
             kind, dist = "rest", 0.0
         else:
             kind = str(change.get("kind") or "").strip().lower()
             if kind not in ALLOWED_KINDS:
                 # default to keeping the existing kind if the model omitted/garbled it
-                existing = get_planned_workout(ds)
                 kind = existing["kind"] if existing else "easy"
             if kind == "rest":
                 dist = 0.0
@@ -754,20 +938,36 @@ def apply_plan_change(change: dict[str, Any], today: date | None = None) -> dict
                 try:
                     dist = float(change.get("distance_km"))
                 except (TypeError, ValueError):
-                    existing = get_planned_workout(ds)
+                    # No distance asked for — this is a pace-only or kind-only
+                    # request, so today's distance stands.
                     dist = float(existing["distance_km"]) if existing else 0.0
                 dist = max(0.0, min(round(dist, 1), cap))
-        # Phase-aware so a coach-chat edit lands the same session the plan would:
-        # a base-phase quality day keeps its easy pace and strides prescription.
         phase = phase_name_for(date.fromisoformat(ds))
-        pace = None if kind == "rest" else pace_for(kind, paces, phase=phase)
+        if kind == "rest":
+            pace = None
+        elif requested_pace:
+            # The athlete named a pace: it wins over the plan's pace for the kind.
+            # This is the one field the plan used to overwrite unconditionally, so
+            # "run today at 5:10" had no way of reaching the watch at all.
+            pace = requested_pace
+        elif existing is not None and existing["source"] == ATHLETE_SOURCE and existing["kind"] == kind and existing["target_pace_sec"]:
+            # A later distance-only edit must not silently undo a pace the athlete
+            # set earlier — only a new pace request replaces one.
+            pace = existing["target_pace_sec"]
+        else:
+            # Phase-aware so a coach-chat edit lands the same session the plan
+            # would: a base-phase quality day keeps its easy pace and strides.
+            pace = pace_for(kind, paces, phase=phase)
         upsert_planned_workout(
             ds, kind, dist, pace, details_for(kind, pace, phase=phase),
-            source="adapted", coach_note="Adjusted via coach chat.", status="planned",
+            source=ATHLETE_SOURCE, coach_note=_ATHLETE_NOTE, status="planned",
             structure=structure_for(kind, phase=phase),
         )
         garmin = _repush_if_needed(ds)
-        return {"status": "applied", "action": action, "date": ds, "kind": kind, "distance_km": dist, "garmin": garmin}
+        return {
+            "status": "applied", "action": action, "date": ds, "kind": kind,
+            "distance_km": dist, "target_pace_sec": pace, "locked": True, "garmin": garmin,
+        }
 
     if action == "swap_days":
         d1 = _validate_date(change.get("date"), today)
@@ -780,20 +980,49 @@ def apply_plan_change(change: dict[str, Any], today: date | None = None) -> dict
         r2 = get_planned_workout(d2)
         if r1 is None or r2 is None:
             return {"status": "rejected", "reason": "one of the dates has no planned workout"}
+        if r1["status"] == "completed" or r2["status"] == "completed":
+            return {"status": "rejected", "reason": "one of the dates is already completed"}
         # Swap kind/distance/pace/details, mark both adapted. The session shape
         # travels with the session so a moved strides day is still pushed as one.
         upsert_planned_workout(
             d1, r2["kind"], r2["distance_km"], r2["target_pace_sec"], r2["details"],
-            source="adapted", coach_note="Swapped via coach chat.", status="planned",
+            source=ATHLETE_SOURCE, coach_note=f"{_ATHLETE_NOTE} Swapped with {d2}.", status="planned",
             structure=row_structure(r2, date.fromisoformat(d2)),
         )
         upsert_planned_workout(
             d2, r1["kind"], r1["distance_km"], r1["target_pace_sec"], r1["details"],
-            source="adapted", coach_note="Swapped via coach chat.", status="planned",
+            source=ATHLETE_SOURCE, coach_note=f"{_ATHLETE_NOTE} Swapped with {d1}.", status="planned",
             structure=row_structure(r1, date.fromisoformat(d1)),
         )
         g1 = _repush_if_needed(d1)
         g2 = _repush_if_needed(d2)
         return {"status": "applied", "action": "swap_days", "date": d1, "date2": d2, "garmin": [g1, g2]}
+
+    if action == "follow_plan":
+        # The release valve for the lock above. Without it a day the athlete once
+        # set in chat could never go back to adapting on its own — "put Thursday
+        # back on plan" would have no way to reach the row.
+        ds = _validate_date(change.get("date"), today)
+        if ds is None:
+            return {"status": "rejected", "reason": f"date out of range or invalid: {change.get('date')!r}"}
+        existing = get_planned_workout(ds)
+        if existing is not None and existing["status"] == "completed":
+            return {"status": "rejected", "reason": f"{ds} is already completed"}
+        plan = get_active_plan()
+        if plan is None:
+            return {"status": "rejected", "reason": "no active plan"}
+        # `materialize` refuses to overwrite a non-rule row, so the athlete's row
+        # is dropped first and rebuilt from the plan's own prescription.
+        delete_planned_workout(ds)
+        materialize(plan, date.fromisoformat(ds), days=1)
+        row = get_planned_workout(ds)
+        if row is None:
+            return {"status": "rejected", "reason": f"the plan has nothing for {ds}"}
+        garmin = _repush_if_needed(ds)
+        return {
+            "status": "applied", "action": action, "date": ds, "kind": row["kind"],
+            "distance_km": row["distance_km"], "target_pace_sec": row["target_pace_sec"],
+            "locked": False, "garmin": garmin,
+        }
 
     return {"status": "rejected", "reason": f"unknown action: {action!r}"}

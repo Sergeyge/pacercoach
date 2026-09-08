@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from datetime import date
+import json
+import sys
+from datetime import date, datetime, timezone
 from typing import Any, Callable
 
 # `garmin_client` is imported lazily inside the fetchers, not here, so this module
@@ -100,6 +102,62 @@ def _calendar_date(obj: Any) -> str | None:
 # here and cannot on their own make a verdict physiological.
 _POST_SLEEP_METRICS = ("training_readiness", "sleep", "hrv")
 
+# Where each post-sleep metric records the instant it was PRODUCED, as opposed to
+# the calendar day it belongs to.
+#
+# This distinction is the whole point. Garmin stamps an overnight training-readiness
+# record with today's `calendarDate` the moment midnight passes — hours before you
+# wake — so a date check alone reads a 03:00 provisional score as "this morning's
+# data". Observed 2026-08-26: at 06:00 the payload was stamped 2026-08-26 and
+# looked fresh, but the athlete woke at 06:23 and the readiness record reflecting
+# that night was not written until 07:45.
+_GENERATED_AT: dict[str, tuple[str, ...]] = {
+    "training_readiness": ("timestamp",),
+    "hrv": ("hrvSummary", "createTimeStamp"),
+    # Sleep is produced by its own ending: the wake instant.
+    "sleep": ("dailySleepDTO", "sleepEndTimestampGMT"),
+}
+
+
+def _as_epoch_ms(v: Any) -> int | None:
+    """Garmin gives UTC instants as epoch milliseconds or as an ISO string.
+
+    Fractional seconds are dropped rather than parsed — they arrive with varying
+    precision ('...:36.0', '...:15.820') and none of it matters at this scale.
+    """
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)) and v > 0:
+        return int(v)
+    if isinstance(v, str) and len(v) >= 19:
+        try:
+            stamp = datetime.fromisoformat(v[:19])
+        except ValueError:
+            return None
+        return int(stamp.replace(tzinfo=timezone.utc).timestamp() * 1000)
+    return None
+
+
+def _generated_at_ms(name: str, obj: Any) -> int | None:
+    """When Garmin produced this payload (epoch ms UTC), or None if it doesn't say."""
+    if isinstance(obj, list):
+        obj = obj[0] if obj else None
+    path = _GENERATED_AT.get(name)
+    if not isinstance(obj, dict) or path is None:
+        return None
+    return _as_epoch_ms(_g(obj, *path))
+
+
+def wake_instant_ms(sleep: Any) -> int | None:
+    """When last night's sleep ended (epoch ms UTC) — the moment from which Garmin
+    can have anything to say about this morning. None while the night is still
+    open or untracked."""
+    return _generated_at_ms("sleep", sleep)
+
+
+def _hhmm_utc(ms: int) -> str:
+    return datetime.fromtimestamp(ms / 1000, timezone.utc).strftime("%H:%MZ")
+
 # Which summary keys each post-sleep metric contributes, so a metric that is
 # stale, missing or undatable can be dropped from the summary before it is scored.
 POST_SLEEP_SUMMARY_KEYS: dict[str, tuple[str, ...]] = {
@@ -113,7 +171,7 @@ POST_SLEEP_SUMMARY_KEYS: dict[str, tuple[str, ...]] = {
 # rather than hand-listed so it cannot drift from the filter above.
 VERIFIED_SUMMARY_KEYS: tuple[str, ...] = tuple(k for keys in POST_SLEEP_SUMMARY_KEYS.values() for k in keys)
 
-_FRESHNESS_KEYS = ("date", "fresh", "have", "unverified", "stale", "missing", "errors", "reason")
+_FRESHNESS_KEYS = ("date", "fresh", "have", "unverified", "stale", "pre_wake", "missing", "errors", "reason")
 
 
 def has_verified_signal(summary: dict[str, Any]) -> bool:
@@ -131,7 +189,7 @@ def has_verified_signal(summary: dict[str, Any]) -> bool:
 def no_freshness(reason: str, errors: dict[str, str] | None = None) -> dict[str, Any]:
     """A freshness report for "we never got a usable answer".
 
-    Both producers here emit exactly the eight `_FRESHNESS_KEYS`, so consumers —
+    Both producers here emit exactly the nine `_FRESHNESS_KEYS`, so consumers —
     including the dashboard's JavaScript — can rely on the shape. `reason` describes
     a whole-call failure (or a payload that scored nothing); `errors` carries
     per-metric Garmin failures. Either may be None.
@@ -142,6 +200,7 @@ def no_freshness(reason: str, errors: dict[str, str] | None = None) -> dict[str,
         "have": [],
         "unverified": [],
         "stale": [],
+        "pre_wake": [],
         "missing": list(_POST_SLEEP_METRICS),
         "errors": errors,
         "reason": reason,
@@ -156,19 +215,34 @@ def recovery_freshness(
     sleep: Any = None,
     errors: dict[str, str] | None = None,
     reason: str | None = None,
+    now_ms: int | None = None,
 ) -> dict[str, Any]:
-    """Whether the post-sleep metrics really are from `day`.
+    """Whether the post-sleep metrics really are from THIS MORNING.
 
     Garmin answers a request for today with null fields when the watch has not
     synced since waking, so a missing metric is indistinguishable from a normal
     morning unless the calendar stamp on the payload is checked.
 
-    `fresh` requires at least one metric CONFIRMED to carry today's date. A
-    payload that is present but undatable is reported as `unverified` and does
-    NOT count as fresh: treating it as fresh meant yesterday's numbers could
-    decide today's session whenever a response shape changed. The morning job
-    proceeds at its cutoff regardless, so an unexpected shape delays the
-    adaptation and logs loudly rather than stalling it forever.
+    `fresh` requires at least one metric to pass BOTH tests:
+
+    1. **Right day.** Its calendar stamp is `day`. A payload that is present but
+       undatable is reported as `unverified` and does NOT count: treating it as
+       fresh meant yesterday's numbers could decide today's session whenever a
+       response shape changed.
+    2. **After you woke.** It was produced at or after `sleepEndTimestampGMT`.
+       The date test alone is not enough — Garmin stamps an overnight readiness
+       record with today's date from midnight, so at 06:00 a provisional score
+       computed while the athlete was still asleep looked exactly like the
+       morning report. Anything older than the wake instant is listed in
+       `pre_wake` and ignored, and while the night is still open (no wake
+       instant, or one in the future) nothing is fresh at all.
+
+    A metric that carries no production timestamp of its own is kept once the
+    night is known to be over: it cannot be shown to predate waking, and by then
+    the provisional-overnight case it would otherwise admit is already past.
+
+    The morning job proceeds at its cutoff regardless, so an unexpected shape
+    delays the adaptation and logs loudly rather than stalling it forever.
 
     `errors` carries `fetch_recovery`'s per-metric failures so callers can tell a
     broken Garmin connection ("401 Unauthorized") from a watch that simply has
@@ -193,6 +267,32 @@ def recovery_freshness(
             stale.append(f"{name}@{stamped}")
         else:
             have.append(name)
+    # Second test: nothing Garmin wrote before you woke describes this morning.
+    payloads = dict(zip(_POST_SLEEP_METRICS, (tr, sleep, hrv)))
+    pre_wake: list[str] = []
+    wake = wake_instant_ms(sleep)
+    now = now_ms if now_ms is not None else int(datetime.now(timezone.utc).timestamp() * 1000)
+    if have and (wake is None or wake > now):
+        # The night is still open (or untracked): every "today" payload in hand
+        # was necessarily written before waking, whatever its calendar stamp.
+        pre_wake, have = have, []
+        reason = reason or (
+            f"last night's sleep has not ended yet (wakes {_hhmm_utc(wake)})"
+            if wake is not None
+            else "no wake time recorded for last night yet"
+        )
+    elif have:
+        confirmed: list[str] = []
+        for name in have:
+            produced = _generated_at_ms(name, payloads[name])
+            if produced is not None and produced < wake:
+                pre_wake.append(f"{name}@{_hhmm_utc(produced)}")
+            else:
+                confirmed.append(name)
+        have = confirmed
+        if not have and not reason:
+            reason = "every metric for today was written before you woke"
+
     failed = {k: v for k, v in (errors or {}).items() if k in _POST_SLEEP_METRICS}
     return {
         "date": day,
@@ -200,6 +300,7 @@ def recovery_freshness(
         "have": have,
         "unverified": unverified,
         "stale": stale,
+        "pre_wake": pre_wake,
         "missing": missing,
         # Set only when Garmin itself refused a call — the difference between
         # "your watch hasn't synced" and "this service can't reach Garmin".
@@ -288,3 +389,104 @@ def fetch_snapshot(cdate: date | None = None) -> dict[str, Any]:
         safe(lambda: client.get_max_metrics(d)),
     )
     return {"date": d, "recovery": rec, "fitness": fit}
+
+
+# --- Cached fitness read -----------------------------------------------------
+
+# VO2max, race predictions and training status move on a scale of weeks, so a
+# reader that just wants to know how fit the athlete is should never pay for a
+# Garmin login. Half a day keeps it current without putting a multi-second fetch
+# in front of an interactive request.
+_FITNESS_CACHE_KEY = "fitness_summary_cache"
+_FITNESS_CACHE_TTL_SEC = 12 * 3600
+
+# Garmin's race-prediction payload keys, in ascending distance.
+_RACE_KEYS = {
+    "5k": "time5K",
+    "10k": "time10K",
+    "half_marathon": "timeHalfMarathon",
+    "marathon": "timeMarathon",
+}
+
+
+def race_predictions(rp: Any) -> dict[str, Any]:
+    """Garmin's predicted race times, as seconds plus a readable pace.
+
+    These are the closest thing to a recent maximal effort that exists without
+    the athlete actually racing, which is exactly what a coach needs to answer a
+    "how fast can I go" question. Garmin returns either a dict or a one-element
+    list depending on the endpoint version.
+    """
+    if isinstance(rp, list):
+        rp = rp[0] if rp else None
+    if not isinstance(rp, dict):
+        return {}
+    dists = {"5k": 5.0, "10k": 10.0, "half_marathon": 21.0975, "marathon": 42.195}
+    out: dict[str, Any] = {}
+    for label, key in _RACE_KEYS.items():
+        secs = rp.get(key)
+        if not isinstance(secs, (int, float)) or secs <= 0:
+            continue
+        pace = round(secs / dists[label])
+        out[label] = {
+            "seconds": int(secs),
+            "time": f"{int(secs) // 3600}:{(int(secs) % 3600) // 60:02d}:{int(secs) % 60:02d}",
+            "pace_sec_per_km": pace,
+            "pace": f"{pace // 60}:{pace % 60:02d}/km",
+            "speed_kmh": round(3600.0 / pace, 2),
+        }
+    return out
+
+
+def _fitness_summary_live(cdate: date | None = None) -> dict[str, Any]:
+    """Compact fitness summary + race predictions. Never raises."""
+    try:
+        raw = fetch_fitness(cdate) or {}
+        m = raw.get("metrics", {}) or {}
+        summary = _summarize_fitness(
+            m.get("training_status"),
+            m.get("race_predictions"),
+            m.get("endurance_score"),
+            m.get("vo2max"),
+        )
+        summary["race_predictions"] = race_predictions(m.get("race_predictions"))
+        summary["date"] = raw.get("date")
+        summary["errors"] = raw.get("errors")
+        return {k: v for k, v in summary.items() if v is not None}
+    except Exception as exc:
+        print(f"[garmin_metrics._fitness_summary_live] {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+        return {"error": f"{type(exc).__name__}: {exc}"[:200]}
+
+
+def cached_fitness_summary(fresh: bool = False, allow_fetch: bool = True) -> dict[str, Any]:
+    """`_fitness_summary_live` behind a ~12h cache. Never raises.
+
+    Failures are cached too, so a revoked Garmin token cannot put a doomed login
+    attempt in front of every interactive request.
+
+    `allow_fetch=False` is cache-only and never touches the network — a cold read
+    costs six Garmin calls, which is not something an interactive request should
+    wait on. The morning job primes the cache.
+    """
+    from .db import get_config, set_config
+
+    if not fresh:
+        try:
+            raw = get_config(_FITNESS_CACHE_KEY)
+            if raw:
+                entry = json.loads(raw)
+                age = (datetime.utcnow() - datetime.fromisoformat(entry["ts"])).total_seconds()
+                if age < _FITNESS_CACHE_TTL_SEC:
+                    return {**entry["data"], "cached": True}
+        except Exception as exc:
+            print(f"[garmin_metrics.cached_fitness_summary] cache read: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+
+    if not allow_fetch:
+        return {"cached": False, "error": "no fitness data cached yet (not fetched here to avoid blocking on Garmin)"}
+
+    data = _fitness_summary_live()
+    try:
+        set_config(_FITNESS_CACHE_KEY, json.dumps({"ts": datetime.utcnow().isoformat(), "data": data}))
+    except Exception as exc:
+        print(f"[garmin_metrics.cached_fitness_summary] cache write: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+    return {**data, "cached": False}
