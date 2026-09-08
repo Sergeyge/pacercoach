@@ -29,7 +29,9 @@ authorities and different failure modes:
 from __future__ import annotations
 
 import json
+import logging
 import sys
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -61,6 +63,26 @@ _PACE_MAX_SEC = 900
 
 def _log_exc(where: str, exc: BaseException) -> None:
     print(f"[zones.{where}] {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+
+
+@contextmanager
+def _quiet_garmin_logger():
+    """Silence garminconnect's own `logger.exception` for the duration of a call.
+
+    Probing for an endpoint that may not exist is normal here — the configured
+    zone table 404s on accounts where only the time-in-zone fallback works — but
+    the library logs every failed request as an exception, traceback and all. On
+    a daily cache refresh that buries the errors an operator actually needs to
+    see. Only wrap calls whose failure is an expected branch, never one whose
+    failure means something is wrong: the outcome is still logged by `_log_exc`.
+    """
+    lg = logging.getLogger("garminconnect")
+    previous = lg.level
+    lg.setLevel(logging.CRITICAL)
+    try:
+        yield
+    finally:
+        lg.setLevel(previous)
 
 
 def _speed_kmh(pace_sec: Any) -> float | None:
@@ -146,7 +168,10 @@ def _fetch_hr_zones_live() -> dict[str, Any]:
     #    goes through the generic GET wrapper.
     for path in ("/biometric-service/heartRateZones", "/biometric-service/heartRateZones/sport/RUNNING"):
         try:
-            zones = _zones_from_payload(client.connectapi(path))
+            # Expected to 404 on accounts where the table is not exposed; the
+            # fallback below is the working source there.
+            with _quiet_garmin_logger():
+                zones = _zones_from_payload(client.connectapi(path))
         except Exception as exc:
             _log_exc(f"fetch_hr_zones_live[{path}]", exc)
             continue
