@@ -374,6 +374,22 @@ def save_plan(goal_id: int, base_weekly_km: float, weekly_template: dict, progre
         return int(cur.lastrowid)
 
 
+def update_plan_progression(plan_id: int, progression: dict) -> None:
+    """Replace one plan's stored progression JSON.
+
+    Used to recalibrate paces from current fitness without rebuilding the plan —
+    `save_plan` would insert a NEW plan row, which `get_active_plan` (ORDER BY id
+    DESC) would then treat as the active one, silently orphaning the phase
+    roadmap and start date the athlete has been training against.
+    """
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE training_plan SET progression = ? WHERE id = ?",
+            (json.dumps(progression), int(plan_id)),
+        )
+        conn.commit()
+
+
 def get_active_plan() -> sqlite3.Row | None:
     with get_conn() as conn:
         return conn.execute(

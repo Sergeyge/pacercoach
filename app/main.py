@@ -39,6 +39,7 @@ from .goal_planner import (
     pace_text,
     parse_target_time,
     plan_phase_overview,
+    recalibrate_paces,
     resume_active_goal_and_shift,
     row_structure,
     title_for,
@@ -607,6 +608,27 @@ def gear() -> dict:
         return fetch_gear()
     except GarminClientError as exc:
         return JSONResponse(status_code=400, content={"status": "error", "error": str(exc)})
+
+
+@app.post("/goal/paces/recalibrate")
+def goal_paces_recalibrate() -> dict:
+    """Re-derive the plan's training paces from current fitness.
+
+    The paces are otherwise computed once, when the goal is set, so a lactate
+    threshold Garmin establishes or revises later never reaches the plan. Only
+    the stored paces change — the phase roadmap, start date and volume
+    progression are left alone, and days already on the watch, coach-adapted or
+    athlete-set keep the pace they were given.
+    """
+    if get_active_goal() is None:
+        return JSONResponse(status_code=404, content={"error": "no active goal"})
+    res = recalibrate_paces()
+    if res.get("status") != "ok":
+        return JSONResponse(status_code=400, content=res)
+    return {
+        **res,
+        "paces_readable": {k: pace_text(v) for k, v in (res.get("paces") or {}).items() if v},
+    }
 
 
 @app.get("/zones")

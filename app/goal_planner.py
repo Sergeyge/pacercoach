@@ -34,7 +34,7 @@ PHASE_ORDER = ["base", "build", "peak", "taper"]
 
 PHASE_FOCUS = {
     "base": "Aerobic foundation — easy volume and strides; build the engine.",
-    "build": "Race-specific quality — tempo and intervals at goal pace on a growing base.",
+    "build": "Race-specific quality — threshold tempo work on a growing base.",
     "peak": "Highest load — longest long runs and race-pace sessions.",
     "taper": "Volume drops, a touch of intensity stays — arrive at race day fresh.",
 }
@@ -56,12 +56,24 @@ PHASE_FOCUS = {
 #                          is not a hard session
 #                  False -> time-based warm-up, then the reps, then a cool-down;
 #                          the planned distance is metadata only
+#   pace_anchor    which pace the day is run at, resolved by `pace_for`:
+#                    'easy'      -> paces['easy']      (a strides day's body)
+#                    'threshold' -> paces['threshold'] (measured lactate threshold,
+#                                   falling back to the goal-anchored 'quality'
+#                                   pace when Garmin has established no LT)
+#                    'goal'      -> paces['quality']   (goal race pace - 5s)
+#                  Build trains THRESHOLD and peak/taper rehearse RACE PACE. Before
+#                  this every phase used the goal-anchored pace, so for any goal
+#                  whose race pace sits slower than the athlete's threshold — which
+#                  is normal for a half or a marathon, where race pace is threshold
+#                  +15..25 s/km — no phase ever trained threshold at all.
 #   reps_at_pace   whether the work intervals carry the day's pace target;
 #                  strides are run fast by feel, so they do not. Currently always
 #                  `not easy_body`; kept separate so a future shape can combine an
 #                  easy body with paced reps.
 QUALITY_SHAPES: dict[str, dict[str, Any]] = {
     "base": {
+        "pace_anchor": "easy",
         "structure": "strides",
         "title": "Easy run + strides",
         "easy_body": True,
@@ -79,6 +91,7 @@ QUALITY_SHAPES: dict[str, dict[str, Any]] = {
         ),
     },
     "build": {
+        "pace_anchor": "threshold",
         "structure": "tempo",
         "title": "Tempo run",
         "easy_body": False,
@@ -89,11 +102,13 @@ QUALITY_SHAPES: dict[str, dict[str, Any]] = {
         "warmup_seconds": 600,
         "cooldown_seconds": 600,
         "prose": (
-            "Warm up {warmup_minutes} min, then {reps} x {work_minutes} min of tempo work near "
-            "goal pace with {recovery_minutes} min jog recoveries, cool down {cooldown_minutes} min."
+            "Warm up {warmup_minutes} min, then {reps} x {work_minutes} min at threshold — "
+            "comfortably hard, the pace you could hold for about an hour — with "
+            "{recovery_minutes} min jog recoveries, cool down {cooldown_minutes} min."
         ),
     },
     "peak": {
+        "pace_anchor": "goal",
         "structure": "intervals",
         "title": "Race-pace intervals",
         "easy_body": False,
@@ -109,6 +124,7 @@ QUALITY_SHAPES: dict[str, dict[str, Any]] = {
         ),
     },
     "taper": {
+        "pace_anchor": "goal",
         "structure": "sharpener",
         "title": "Race-pace sharpener",
         "easy_body": False,
@@ -319,11 +335,26 @@ def is_strides_session(kind: str, *, phase: str | None = None) -> bool:
 
 
 def pace_for(kind: str, paces: dict[str, Any], *, phase: str | None = None) -> int | None:
-    """The day's target pace. A strides day runs at EASY pace — the strides
-    themselves are by feel — so it must not inherit the near-goal-pace quality
-    target, which would describe the session as a tempo run."""
-    if is_strides_session(kind, phase=phase):
-        return paces.get("easy")
+    """The day's target pace, resolved through the shape's `pace_anchor`.
+
+    A strides day runs at EASY pace — the strides themselves are by feel — so it
+    must not inherit the near-goal-pace quality target, which would describe the
+    session as a tempo run. A build-phase tempo runs at measured THRESHOLD, which
+    for a half or marathon goal is meaningfully faster than the goal-anchored
+    'quality' pace; peak and taper rehearse race pace and so use that one.
+
+    An unknown anchor, and a 'threshold' anchor on a plan that carries no measured
+    threshold, both fall back to the goal-anchored pace — the value every plan
+    has, so a plan built before threshold anchoring behaves exactly as it did.
+    """
+    shape = shape_for(kind, phase=phase)
+    if shape:
+        anchor = shape.get("pace_anchor", "goal")
+        if anchor == "easy":
+            return paces.get("easy")
+        if anchor == "threshold":
+            return paces.get("threshold") or paces.get("quality")
+        return paces.get("quality")
     return paces.get(kind)
 
 
@@ -389,15 +420,40 @@ def row_structure(row: Any, plan_date: date) -> str | None:
     return structure_for(kind, phase=phase)
 
 
-def derive_paces(goal_pace_sec: int) -> dict[str, int | None]:
-    """Easy/long/recovery slower than goal pace; quality near goal pace."""
-    return {
+# Plausible band for a measured lactate-threshold pace (sec/km), matching the
+# bounds used elsewhere on an athlete-supplied pace. A value outside it is a unit
+# change or a bad read, not a threshold, and must not become a training target.
+_THRESHOLD_MIN_SEC = 150
+_THRESHOLD_MAX_SEC = 900
+
+
+def derive_paces(goal_pace_sec: int, threshold_pace_sec: int | None = None) -> dict[str, int | None]:
+    """Easy/long/recovery slower than goal pace; quality near goal pace.
+
+    `threshold_pace_sec` is the athlete's MEASURED lactate-threshold pace, stored
+    alongside the goal-derived values rather than replacing them: build-phase
+    tempo work resolves to it (see `pace_for`) while peak and taper keep
+    rehearsing race pace. Omitted or implausible, it is simply absent and every
+    phase falls back to the goal-anchored pace.
+    """
+    paces: dict[str, int | None] = {
         "easy": goal_pace_sec + 75,
         "long": goal_pace_sec + 60,
         "recovery": goal_pace_sec + 105,
         "quality": max(goal_pace_sec - 5, 180),
         "rest": None,
     }
+    if isinstance(threshold_pace_sec, (int, float)) and (
+        _THRESHOLD_MIN_SEC <= int(threshold_pace_sec) <= _THRESHOLD_MAX_SEC
+    ):
+        paces["threshold"] = int(threshold_pace_sec)
+    elif threshold_pace_sec is not None:
+        print(
+            f"[goal_planner.derive_paces] ignoring implausible threshold pace {threshold_pace_sec!r}",
+            file=sys.stderr,
+            flush=True,
+        )
+    return paces
 
 
 def _base_weekly_km(runs: list[dict[str, Any]], today: date) -> float:
@@ -439,6 +495,71 @@ def weekly_volume(base: float, week_index: int, prog: dict[str, Any]) -> float:
     return round(vol * 2) / 2  # nearest 0.5 km
 
 
+def measured_threshold_pace(allow_fetch: bool = True) -> int | None:
+    """The athlete's measured lactate-threshold pace (sec/km), or None.
+
+    Read through the cached zone report, so a plan build normally costs no Garmin
+    call and a failure costs nothing at all: without a threshold every phase
+    falls back to the goal-anchored pace, which is what plans did before.
+    """
+    try:
+        from .zones import hr_zones
+
+        lt = hr_zones(allow_fetch=allow_fetch).get("lactate_threshold") or {}
+        pace = lt.get("pace_sec_per_km")
+        return int(pace) if isinstance(pace, (int, float)) and pace > 0 else None
+    except Exception as exc:
+        print(f"[goal_planner.measured_threshold_pace] {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+        return None
+
+
+def recalibrate_paces(today: date | None = None, allow_fetch: bool = True) -> dict[str, Any]:
+    """Re-derive the active plan's paces from current fitness, in place.
+
+    Exists because the paces are computed once at plan creation: a threshold that
+    Garmin establishes or revises later never reaches the plan, so a build-phase
+    tempo would keep running at whatever the goal implied on the day the goal was
+    set. Only the stored `paces` change — the phase roadmap, start date and
+    volume progression are untouched, so this is not a plan rebuild.
+
+    Future untouched rule projections are then refreshed by `materialize`
+    (`_is_stale_projection` compares the pace), while days already pushed to the
+    watch, coach-adapted or athlete-set are deliberately left as they are.
+    """
+    from .db import get_active_plan, update_plan_progression
+
+    today = today or date.today()
+    plan = get_active_plan()
+    if plan is None:
+        return {"status": "error", "error": "no active plan"}
+    prog = json.loads(plan["progression"])
+    before = dict(prog.get("paces") or {})
+    threshold = measured_threshold_pace(allow_fetch=allow_fetch)
+    prog["paces"] = derive_paces(int(prog["goal_pace_sec"]), threshold)
+    prog["paces_recalibrated_at"] = today.isoformat()
+    update_plan_progression(int(plan["id"]), prog)
+
+    # Push the new paces into the days that may still change.
+    refreshed = materialize({
+        "weekly_template": plan["weekly_template"],
+        "progression": json.dumps(prog),
+        "base_weekly_km": plan["base_weekly_km"],
+    }, today, days=21)
+
+    changed = {
+        k: {"from": before.get(k), "to": v}
+        for k, v in prog["paces"].items()
+        if before.get(k) != v
+    }
+    return {
+        "status": "ok",
+        "threshold_pace_sec": threshold,
+        "paces": prog["paces"],
+        "changed": changed,
+        "days_refreshed": refreshed,
+    }
+
+
 def build_and_store_plan(
     goal_id: int,
     distance_km: float,
@@ -449,7 +570,7 @@ def build_and_store_plan(
 ) -> dict[str, Any]:
     today = today or date.today()
     goal_pace = round(target_seconds / distance_km)
-    paces = derive_paces(goal_pace)
+    paces = derive_paces(goal_pace, measured_threshold_pace())
     base = _base_weekly_km(runs, today)
     if race_date is not None:
         total_weeks = max(4, math.ceil((race_date - today).days / 7))
@@ -550,13 +671,17 @@ def _is_stale_projection(
     )
 
 
-def materialize(plan_row: sqlite3.Row | dict[str, Any], start: date, days: int = 14) -> None:
+def materialize(plan_row: sqlite3.Row | dict[str, Any], start: date, days: int = 14) -> int:
     """Create rule-based planned_workout rows for `days` from `start`.
 
     Adapted, completed and already-pushed days are left untouched. Untouched
     rule projections are refreshed when the plan's rules would now prescribe
     something different (see `_is_stale_projection`).
+
+    Returns how many days were written, so a caller that changed the plan's rules
+    can report whether anything actually reached the calendar.
     """
+    written = 0
     template = {int(k): v for k, v in json.loads(plan_row["weekly_template"]).items()}
     prog = json.loads(plan_row["progression"])
     paces = prog.get("paces", {})
@@ -572,6 +697,7 @@ def materialize(plan_row: sqlite3.Row | dict[str, Any], start: date, days: int =
             details = details_for("rest", None)
             if existing is None or _is_stale_projection(existing, "rest", 0.0, None, details, None):
                 upsert_planned_workout(ds, "rest", 0.0, None, details, source="rule")
+                written += 1
             continue
         week_index = max(0, (day - plan_start).days // 7)
         wk = weekly_volume(base, week_index, prog)
@@ -583,6 +709,8 @@ def materialize(plan_row: sqlite3.Row | dict[str, Any], start: date, days: int =
         structure = structure_for(kind, phase=phase)
         if existing is None or _is_stale_projection(existing, kind, distance, pace, details, structure):
             upsert_planned_workout(ds, kind, distance, pace, details, source="rule", structure=structure)
+            written += 1
+    return written
 
 
 def plan_phase_overview(today: date | None = None) -> dict[str, Any]:
