@@ -21,6 +21,62 @@ from .models import Readiness
 _VERIFIABLE_SIGNALS = VERIFIED_SUMMARY_KEYS
 
 
+# A trailing week counts toward the chronic baseline only if the athlete actually
+# trained in it. One token run is a gap, not a training week, and averaging it in
+# understates the baseline the acute load is compared against.
+_MIN_WEEK_RUNS = 2
+
+# Never let the baseline be drawn from fewer than this many weeks. Two weeks of
+# real training is thin but usable; below that the ratio says more about the
+# window than about the athlete, so the full four-week divisor is kept and the
+# load signal stays deliberately weak rather than confidently wrong.
+_MIN_BASELINE_WEEKS = 2
+
+
+def _chronic_baseline(runs: list[dict], today: date) -> float:
+    """Average weekly volume over the trailing four weeks, ignoring weeks with
+    no real training.
+
+    `total / 4` treats a week the athlete missed as a week they ran zero, which
+    drags the baseline down and makes their current, on-plan volume look like a
+    spike. That is not a hypothetical: a single-run week 4 weeks back put the
+    ratio at 1.47 (37.0 km against a 25.2 km/wk baseline) on a morning when
+    every recovery metric was strong, and the -25 penalty that follows is large
+    enough to force yellow on its own — so the day's tempo was downgraded to an
+    easy run because of a gap three weeks earlier. Averaged over the three weeks
+    actually trained the baseline is 31.4 km/wk and the ratio 1.18 — still above
+    the 1.15 mark, so the load signal is not silenced, just no longer tripping
+    the severe -25 band on the strength of a missed week.
+
+    `goal_planner._base_weekly_km` already guards against exactly this dilution
+    when it sets a plan's starting volume; this is the same correction for the
+    readiness side, which had none.
+    """
+    weeks: list[float] = []
+    for w in range(4):
+        hi = today - timedelta(days=7 * w)
+        lo = today - timedelta(days=7 * (w + 1))
+        # Half-open [lo, hi) so a run on a boundary date lands in exactly one
+        # week and cannot be counted twice.
+        in_week = [
+            r["distance_km"]
+            for r in runs
+            if lo <= date.fromisoformat(r["activity_date"]) < hi
+        ]
+        if len(in_week) >= _MIN_WEEK_RUNS:
+            weeks.append(sum(in_week))
+
+    if len(weeks) >= _MIN_BASELINE_WEEKS:
+        return sum(weeks) / len(weeks)
+
+    # Too few trained weeks to form a baseline: fall back to the old flat
+    # divisor. It under-reads the baseline, which biases toward caution — the
+    # right direction to fail when we genuinely cannot tell.
+    last_28 = today - timedelta(days=28)
+    total = sum(r["distance_km"] for r in runs if date.fromisoformat(r["activity_date"]) >= last_28)
+    return total / 4 if total else 0.0
+
+
 def _physiological_adjust(m: dict[str, Any]) -> tuple[int, list[str], bool]:
     """Score delta, explanations, and whether any known signal was present.
 
@@ -112,36 +168,36 @@ def calculate_readiness(
     """
     today = today or date.today()
     last_7 = today - timedelta(days=7)
-    last_28 = today - timedelta(days=28)
 
     weekly = sum(r["distance_km"] for r in runs if date.fromisoformat(r["activity_date"]) >= last_7)
-    four_week_total = sum(r["distance_km"] for r in runs if date.fromisoformat(r["activity_date"]) >= last_28)
-    four_week_avg = four_week_total / 4 if four_week_total else 0
+    four_week_avg = _chronic_baseline(runs, today)
 
     ratio = weekly / four_week_avg if four_week_avg > 0 else None
-    score = 80
     reasons: list[str] = []
 
+    load_delta = 0
     if ratio is not None:
         if ratio > 1.35:
-            score -= 25
+            load_delta -= 25
             reasons.append("weekly load is much higher than recent baseline")
         elif ratio > 1.15:
-            score -= 10
+            load_delta -= 10
             reasons.append("weekly load is moderately higher than recent baseline")
         elif ratio < 0.6 and four_week_avg > 10:
-            score -= 5
+            load_delta -= 5
             reasons.append("recent load is low; rebuild gradually")
 
     if weekly == 0:
-        score -= 10
+        load_delta -= 10
         reasons.append("no running activity in the last 7 days")
 
     physiological = False
+    physiological_delta = 0
     if metrics:
-        delta, metric_reasons, physiological = _physiological_adjust(metrics)
-        score += delta
+        physiological_delta, metric_reasons, physiological = _physiological_adjust(metrics)
         reasons.extend(metric_reasons)
+
+    score = 80 + load_delta + physiological_delta
 
     status = "green"
     if score < 55:
@@ -162,4 +218,6 @@ def calculate_readiness(
         four_week_avg_km=round(four_week_avg, 1),
         acute_chronic_ratio=round(ratio, 2) if ratio is not None else None,
         physiological=physiological,
+        load_delta=load_delta,
+        physiological_delta=physiological_delta,
     )

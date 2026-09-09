@@ -678,6 +678,13 @@ def coach_ask(body: AskIn) -> dict:
             "status": readiness.status,
             "reasons": readiness.reasons,
             "from_recovery_metrics": readiness.physiological,
+            # The split behind the score, so "why was my session changed?" can be
+            # answered with the actual cause instead of a guess.
+            "load_delta": readiness.load_delta,
+            "physiological_delta": readiness.physiological_delta,
+            "weekly_km": readiness.weekly_distance_km,
+            "chronic_baseline_km": readiness.four_week_avg_km,
+            "acute_chronic_ratio": readiness.acute_chronic_ratio,
         },
         "morning_metrics": metrics,
         "morning_metrics_freshness": metrics_freshness,

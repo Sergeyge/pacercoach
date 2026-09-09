@@ -29,3 +29,16 @@ class Readiness:
     # verdict reflects training load alone — either nothing had synced, or the
     # caller did not ask for metrics (e.g. GET /readiness without live=true).
     physiological: bool = False
+    # The two contributions to `score`, kept apart so a consumer can tell a
+    # volume spike from a body that needs a break. Both are signed deltas off
+    # the base of 80: `load_delta` from the acute:chronic ratio, and
+    # `physiological_delta` from this morning's recovery metrics (0 when none
+    # were scored — check `physiological` before reading it as "recovery is
+    # fine", since "no deduction" and "no data" both come through as 0).
+    #
+    # `daily_coach._rule_adjust` needs this because the two warrant different
+    # responses: too much volume this week means run less, while poor recovery
+    # means run easier. Without the split, a yellow caused purely by load also
+    # stripped the session's intensity.
+    load_delta: int = 0
+    physiological_delta: int = 0

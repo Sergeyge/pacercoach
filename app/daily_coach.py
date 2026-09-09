@@ -32,6 +32,7 @@ from .goal_planner import (
     phase_context,
     phase_name_for,
     row_structure,
+    shape_for,
     structure_for,
     title_for,
 )
@@ -347,14 +348,47 @@ def _rule_adjust(
         notes.append("readiness red → rest")
         kind_eased = volume_eased = True
     elif readiness.status == "yellow":
+        # WHY it is yellow decides WHAT gets eased. Too much volume this week
+        # means run less; a body that has not recovered means run easier. Only
+        # the second warrants losing the session's intensity.
+        #
+        # `physiological` must be checked too: a missing recovery read also
+        # scores 0, and "we have no data" is not "you are fine". Without that
+        # test this would quietly relax the guard on exactly the mornings we know
+        # least — the opposite of failing closed.
+        load_only_yellow = readiness.physiological and readiness.physiological_delta >= 0
+        # A structured session (tempo/intervals/sharpener) is prescribed by
+        # DURATION: `workout_publisher._shaped_steps` builds a timed warm-up, the
+        # reps and a cool-down, and never reads the planned distance. Trimming
+        # that number would change the stored figure, the morning email and this
+        # note while the watch received the identical session — the exact drift
+        # `_merge_clamp` exists to prevent. So on such a day the trim is not
+        # applied and not claimed.
+        shape = shape_for(kind, phase=phase)
+        time_driven = bool(shape and not shape["easy_body"])
         # A base-phase strides day already runs at easy pace, so there is no
         # intensity to ease out of — trimming the volume is the whole adjustment.
-        if kind == "quality" and not is_strides_session(kind, phase=phase):
+        if kind == "quality" and not is_strides_session(kind, phase=phase) and not load_only_yellow:
             kind, pace = "easy", paces.get("easy")
             notes.append("readiness yellow → quality eased to aerobic")
             kind_eased = True
-        dist = round(dist * 0.8, 1)
-        notes.append("volume trimmed ~20% for caution")
+            time_driven = False  # now a plain distance-based easy run
+        if time_driven:
+            notes.append(
+                "readiness yellow from training load alone (recovery metrics are fine) → "
+                "session kept as prescribed; it is prescribed by time, so there is no "
+                "distance to trim — the week's easy and long days carry the volume cut instead"
+            )
+        else:
+            dist = round(dist * 0.8, 1)
+            notes.append(
+                "readiness yellow from training load alone (recovery metrics are fine) → "
+                "session kept, volume trimmed ~20%"
+                if load_only_yellow
+                else "volume trimmed ~20% for caution"
+            )
+        # True even when nothing was trimmed above: readiness still eased today,
+        # and this is what stops the coach adding volume or swapping the session.
         volume_eased = True
 
     # A missed long run may be moved onto an easy/recovery day. This fires only
@@ -709,6 +743,9 @@ def adapt_today(
             "status": readiness.status,
             "reasons": readiness.reasons,
             "from_recovery_metrics": readiness.physiological,
+            "load_delta": readiness.load_delta,
+            "physiological_delta": readiness.physiological_delta,
+            "acute_chronic_ratio": readiness.acute_chronic_ratio,
         },
         "morning_metrics": metrics,
         "morning_metrics_freshness": metrics_freshness,
