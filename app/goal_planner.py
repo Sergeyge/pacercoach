@@ -507,7 +507,22 @@ def measured_threshold_pace(allow_fetch: bool = True) -> int | None:
 
         lt = hr_zones(allow_fetch=allow_fetch).get("lactate_threshold") or {}
         pace = lt.get("pace_sec_per_km")
-        return int(pace) if isinstance(pace, (int, float)) and pace > 0 else None
+        if not isinstance(pace, (int, float)) or pace <= 0:
+            return None
+        # An out-of-band reading is not a threshold, so report it the same way as
+        # no reading at all. `recalibrate_paces` then keeps the stored value; if
+        # this returned the bad number instead, `derive_paces` would reject it a
+        # step later and the stored threshold would be dropped anyway — while the
+        # result still claimed the reading was "measured".
+        if not (_THRESHOLD_MIN_SEC <= int(pace) <= _THRESHOLD_MAX_SEC):
+            print(
+                f"[goal_planner.measured_threshold_pace] discarding implausible "
+                f"threshold pace {pace!r} sec/km",
+                file=sys.stderr,
+                flush=True,
+            )
+            return None
+        return int(pace)
     except Exception as exc:
         print(f"[goal_planner.measured_threshold_pace] {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
         return None
@@ -535,8 +550,36 @@ def recalibrate_paces(today: date | None = None, allow_fetch: bool = True) -> di
     prog = json.loads(plan["progression"])
     before = dict(prog.get("paces") or {})
     threshold = measured_threshold_pace(allow_fetch=allow_fetch)
+
+    # A threshold we cannot read right now is NOT a threshold of zero. Garmin
+    # being unreachable — or the cached zone read holding a failure — would
+    # otherwise drop the stored value, and since build-phase tempo falls back to
+    # the goal-anchored pace when no threshold is present, an unlucky call would
+    # silently put the athlete's tempo back to race pace. Keep what we had and
+    # say which happened.
+    source = "measured"
+    if threshold is None:
+        threshold = before.get("threshold")
+        source = "retained" if threshold is not None else "none"
+        note = (
+            f"pace recalibration could not read a threshold; kept the stored {threshold}s/km"
+            if source == "retained"
+            else "pace recalibration could not read a threshold and none was stored; "
+            "quality days fall back to goal pace"
+        )
+        print(f"[goal_planner.recalibrate_paces] {note}", file=sys.stderr, flush=True)
+        try:
+            from .db import add_sync_log
+
+            add_sync_log("warn", note, 0)
+        except Exception as exc:
+            print(f"[goal_planner.recalibrate_paces] add_sync_log: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+
     prog["paces"] = derive_paces(int(prog["goal_pace_sec"]), threshold)
-    prog["paces_recalibrated_at"] = today.isoformat()
+    # Only a fresh reading means the paces now reflect current fitness; a
+    # retained one must not make a stale plan look just-measured.
+    if source == "measured":
+        prog["paces_recalibrated_at"] = today.isoformat()
     update_plan_progression(int(plan["id"]), prog)
 
     # Push the new paces into the days that may still change.
@@ -554,6 +597,10 @@ def recalibrate_paces(today: date | None = None, allow_fetch: bool = True) -> di
     return {
         "status": "ok",
         "threshold_pace_sec": threshold,
+        # 'measured' = read from Garmin just now; 'retained' = the read failed and
+        # the previously stored value was kept; 'none' = no threshold at all, so
+        # quality days use the goal-anchored pace.
+        "threshold_source": source,
         "paces": prog["paces"],
         "changed": changed,
         "days_refreshed": refreshed,
