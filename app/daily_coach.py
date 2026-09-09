@@ -32,7 +32,6 @@ from .goal_planner import (
     phase_context,
     phase_name_for,
     row_structure,
-    shape_for,
     structure_for,
     title_for,
 )
@@ -342,54 +341,54 @@ def _rule_adjust(
     # its strides, it just gets shorter).
     kind_eased = False
     volume_eased = False
+    # Set when readiness is yellow but nothing about the ATHLETE warrants a
+    # change: the planned session stands untouched, and elevated load is equally
+    # no reason to let the coach add to it. Not an "eased" flag — nothing was
+    # reduced, so the session type stays locked and the day cannot be cancelled.
+    hold_to_plan = False
 
     if readiness.status == "red":
         kind, dist, pace = "rest", 0.0, None
         notes.append("readiness red → rest")
         kind_eased = volume_eased = True
     elif readiness.status == "yellow":
-        # WHY it is yellow decides WHAT gets eased. Too much volume this week
-        # means run less; a body that has not recovered means run easier. Only
-        # the second warrants losing the session's intensity.
+        # A yellow day is only REDUCED when this morning's recovery metrics say
+        # something is wrong with the athlete. Training volume on its own is not
+        # a reason to cut the session: the plan already decides how much to run
+        # and ramps it deliberately, so letting the acute:chronic ratio also trim
+        # the day double-counts the plan's own progression — and a gap in the
+        # trailing window was enough to downgrade a tempo on a morning when every
+        # recovery marker was strong.
         #
-        # `physiological` must be checked too: a missing recovery read also
-        # scores 0, and "we have no data" is not "you are fine". Without that
-        # test this would quietly relax the guard on exactly the mornings we know
-        # least — the opposite of failing closed.
-        load_only_yellow = readiness.physiological and readiness.physiological_delta >= 0
-        # A structured session (tempo/intervals/sharpener) is prescribed by
-        # DURATION: `workout_publisher._shaped_steps` builds a timed warm-up, the
-        # reps and a cool-down, and never reads the planned distance. Trimming
-        # that number would change the stored figure, the morning email and this
-        # note while the watch received the identical session — the exact drift
-        # `_merge_clamp` exists to prevent. So on such a day the trim is not
-        # applied and not claimed.
-        shape = shape_for(kind, phase=phase)
-        time_driven = bool(shape and not shape["easy_body"])
-        # A base-phase strides day already runs at easy pace, so there is no
-        # intensity to ease out of — trimming the volume is the whole adjustment.
-        if kind == "quality" and not is_strides_session(kind, phase=phase) and not load_only_yellow:
-            kind, pace = "easy", paces.get("easy")
-            notes.append("readiness yellow → quality eased to aerobic")
-            kind_eased = True
-            time_driven = False  # now a plain distance-based easy run
-        if time_driven:
-            notes.append(
-                "readiness yellow from training load alone (recovery metrics are fine) → "
-                "session kept as prescribed; it is prescribed by time, so there is no "
-                "distance to trim — the week's easy and long days carry the volume cut instead"
-            )
-        else:
+        # `physiological_delta < 0` is the test, so it is true only when a metric
+        # actually scored a deduction. A morning with no recovery data scores 0
+        # and therefore holds the plan: with nothing measured there is no health
+        # signal to act on, and the plan is what we have. `_blind_disclosure` in
+        # `adapt_today` tells the athlete the day was set without recovery data.
+        health_issue = readiness.physiological_delta < 0
+        if health_issue:
+            # A base-phase strides day already runs at easy pace, so there is no
+            # intensity to ease out of — trimming the volume is the whole
+            # adjustment. Every other quality day drops to aerobic, which also
+            # makes the day distance-driven, so the trim below is always real.
+            if kind == "quality" and not is_strides_session(kind, phase=phase):
+                kind, pace = "easy", paces.get("easy")
+                notes.append("readiness yellow → quality eased to aerobic")
+                kind_eased = True
             dist = round(dist * 0.8, 1)
+            notes.append("volume trimmed ~20% for caution")
+            volume_eased = True
+        else:
             notes.append(
-                "readiness yellow from training load alone (recovery metrics are fine) → "
-                "session kept, volume trimmed ~20%"
-                if load_only_yellow
-                else "volume trimmed ~20% for caution"
+                "readiness yellow from training load alone"
+                + (
+                    " (recovery metrics are fine)"
+                    if readiness.physiological
+                    else " (no recovery data to check it against)"
+                )
+                + " → session kept exactly as planned"
             )
-        # True even when nothing was trimmed above: readiness still eased today,
-        # and this is what stops the coach adding volume or swapping the session.
-        volume_eased = True
+            hold_to_plan = True
 
     # A missed long run may be moved onto an easy/recovery day. This fires only
     # when readiness is green — exactly where the kind lock below would otherwise
@@ -419,6 +418,11 @@ def _rule_adjust(
         # During taper the plan is a hard ceiling — a missed session is never
         # "made up" this close to the race.
         max_km = round(base["distance_km"], 1)
+    elif hold_to_plan:
+        # "Exactly as planned" cuts both ways: no trim, and none of the usual 10%
+        # headroom either, because the reason this day is yellow is that weekly
+        # volume is already running hot.
+        max_km = round(max(dist, base["distance_km"]), 1)
     else:
         max_km = round(max(dist, base["distance_km"]) * 1.1, 1)
         if offer_long and long_km:
