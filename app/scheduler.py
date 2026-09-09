@@ -16,6 +16,18 @@ scheduler = BackgroundScheduler()
 # produce an endless run of Garmin calls.
 _ATTEMPT_CEILING = 48
 
+# app_config key recording when the weekly pace recalibration last ATTEMPTED to
+# run. Deliberately the attempt and not the success: `paces_recalibrated_at` in
+# the plan only advances on a real reading, so keying off that would retry every
+# morning through a Garmin outage and put a warn row in `sync_log` each time.
+_PACES_ATTEMPT_KEY = "paces_recalibrate_last_attempt"
+
+# Roughly weekly, measured from the last attempt rather than pinned to a weekday.
+# A threshold moves over weeks, so more often just makes the coming week's tempo
+# target shift under the athlete; and "7 days since we last tried" means a
+# morning that never completed catches up the next day instead of losing the week.
+_PACES_EVERY_DAYS = 7
+
 # app_config key recording the date the morning routine last ran to completion.
 # Used instead of `garmin_workout_id` as the "already handled today" marker,
 # because that id is only set when the PUSH succeeds — so a failed push would look
@@ -111,6 +123,70 @@ def _schedule_metrics_retry(attempt: int) -> bool:
         flush=True,
     )
     return True
+
+
+def _recalibrate_paces_weekly(today: date) -> None:
+    """Re-derive the plan's training paces from current fitness, about weekly.
+
+    The paces are otherwise fixed at goal creation, so a lactate threshold Garmin
+    establishes or revises later never reaches the plan and build-phase tempo
+    keeps running at whatever the goal implied months ago.
+
+    Runs before `adapt_today` so today's session already carries any new pace.
+    Never raises, and a change is written to `sync_log` — a training pace that
+    moved on its own must be something the athlete can find an explanation for.
+    """
+    try:
+        from .db import get_config, set_config
+
+        last = get_config(_PACES_ATTEMPT_KEY, "") or ""
+        if last:
+            try:
+                if (today - date.fromisoformat(last)).days < _PACES_EVERY_DAYS:
+                    return
+            except ValueError:
+                pass  # unreadable marker — treat as never attempted
+        set_config(_PACES_ATTEMPT_KEY, today.isoformat())
+    except Exception as exc:
+        _log_exc("recalibrate_paces_weekly[marker]", exc)
+        return
+
+    try:
+        from .goal_planner import pace_text, recalibrate_paces
+
+        res = recalibrate_paces(today=today)
+    except Exception as exc:
+        _log_exc("recalibrate_paces_weekly", exc)
+        return
+
+    if res.get("status") != "ok":
+        _log_exc("recalibrate_paces_weekly", RuntimeError(str(res.get("error"))))
+        return
+
+    changed = res.get("changed") or {}
+    if not changed:
+        print(
+            f"[scheduler] weekly pace check: no change "
+            f"(threshold {res.get('threshold_source')})",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+    try:
+        from .db import add_sync_log
+
+        moved = "; ".join(
+            f"{k} {pace_text(v.get('from')) or 'unset'} → {pace_text(v.get('to')) or 'unset'}"
+            for k, v in changed.items()
+        )
+        add_sync_log(
+            "info",
+            f"training paces recalibrated from current fitness ({moved}); "
+            f"{res.get('days_refreshed', 0)} planned day(s) updated",
+            0,
+        )
+    except Exception as exc:
+        _log_exc("recalibrate_paces_weekly[log]", exc)
 
 
 def _announce_morning(workout: dict | None, freshness: dict) -> None:
@@ -261,6 +337,10 @@ def _morning_update(attempt: int = 1) -> None:
         cached_fitness_summary()
     except Exception as exc:
         _log_exc("warm_zone_fitness_caches", exc)
+
+    # After the zone cache is warm (the threshold is read through it) and before
+    # today's session is built, so a new pace reaches today rather than tomorrow.
+    _recalibrate_paces_weekly(_local_now().date())
 
     try:
         from .daily_coach import adapt_today, ensure_horizon
